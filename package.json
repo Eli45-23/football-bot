@@ -1,0 +1,45 @@
+{
+  "name": "nfl-discord-bot",
+  "version": "1.0.0",
+  "description": "Production-grade NFL Discord bot with daily updates and player profiles",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "deploy": "node deploy-commands.js",
+    "test": "node test-updates.js",
+    "test-updates-command": "node test-updates-command.js",
+    "test-status-command": "node test-status-command.js",
+    "test-enhanced-status": "node test-enhanced-status.js",
+    "test-injuries": "node test-injuries-command.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.2",
+    "bottleneck": "^2.19.5",
+    "dayjs": "^1.11.13",
+    "discord.js": "^14.14.1",
+    "dotenv": "^16.3.1",
+    "keyv": "^5.5.0",
+    "moment-timezone": "^0.5.43",
+    "node-cron": "^3.0.3",
+    "openai": "^4.24.1",
+    "rss-parser": "^3.13.0",
+    "sqlite3": "^5.1.7"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "keywords": [
+    "discord",
+    "bot",
+    "nfl",
+    "sports",
+    "api",
+    "openai"
+  ],
+  "author": "NFL Bot Developer",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
