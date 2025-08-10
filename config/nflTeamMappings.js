@@ -1,144 +1,165 @@
 /**
- * NFL Team ID Mappings for TheSportsDB
- * Hardcoded to avoid unnecessary API calls for team searches
- * Last updated: August 2025
+ * NFL Team abbreviation mappings
+ * Maps team abbreviations to full names and vice versa
  */
 
-const nflTeamMappings = {
+const teamMappings = {
   // AFC East
-  'Buffalo Bills': '134918',
-  'Miami Dolphins': '134919',
-  'New England Patriots': '134920',
-  'New York Jets': '134921',
+  'BUF': 'Buffalo Bills',
+  'MIA': 'Miami Dolphins',
+  'NE': 'New England Patriots',
+  'NYJ': 'New York Jets',
   
   // AFC North
-  'Baltimore Ravens': '134922',
-  'Cincinnati Bengals': '134923',
-  'Cleveland Browns': '134924',
-  'Pittsburgh Steelers': '134925',
+  'BAL': 'Baltimore Ravens',
+  'CIN': 'Cincinnati Bengals',
+  'CLE': 'Cleveland Browns',
+  'PIT': 'Pittsburgh Steelers',
   
   // AFC South
-  'Houston Texans': '134926',
-  'Indianapolis Colts': '134927',
-  'Jacksonville Jaguars': '134928',
-  'Tennessee Titans': '134929',
+  'HOU': 'Houston Texans',
+  'IND': 'Indianapolis Colts',
+  'JAX': 'Jacksonville Jaguars',
+  'TEN': 'Tennessee Titans',
   
   // AFC West
-  'Denver Broncos': '134930',
-  'Kansas City Chiefs': '135907',
-  'Las Vegas Raiders': '134932',
-  'Los Angeles Chargers': '135908',
+  'DEN': 'Denver Broncos',
+  'KC': 'Kansas City Chiefs',
+  'LV': 'Las Vegas Raiders',
+  'LAC': 'Los Angeles Chargers',
   
   // NFC East
-  'Dallas Cowboys': '134934',
-  'New York Giants': '134935',
-  'Philadelphia Eagles': '134936',
-  'Washington Commanders': '134937', // Previously Washington Redskins/Football Team
+  'DAL': 'Dallas Cowboys',
+  'NYG': 'New York Giants',
+  'PHI': 'Philadelphia Eagles',
+  'WAS': 'Washington Commanders',
   
   // NFC North
-  'Chicago Bears': '134938',
-  'Detroit Lions': '134939',
-  'Green Bay Packers': '134940',
-  'Minnesota Vikings': '134941',
+  'CHI': 'Chicago Bears',
+  'DET': 'Detroit Lions',
+  'GB': 'Green Bay Packers',
+  'MIN': 'Minnesota Vikings',
   
   // NFC South
-  'Atlanta Falcons': '134942',
-  'Carolina Panthers': '134943',
-  'New Orleans Saints': '134944',
-  'Tampa Bay Buccaneers': '134945',
+  'ATL': 'Atlanta Falcons',
+  'CAR': 'Carolina Panthers',
+  'NO': 'New Orleans Saints',
+  'TB': 'Tampa Bay Buccaneers',
   
   // NFC West
-  'Arizona Cardinals': '134946',
-  'Los Angeles Rams': '135909',
-  'San Francisco 49ers': '134948',
-  'Seattle Seahawks': '134949'
+  'ARI': 'Arizona Cardinals',
+  'LAR': 'Los Angeles Rams',
+  'SF': 'San Francisco 49ers',
+  'SEA': 'Seattle Seahawks'
 };
 
-// Reverse mapping for quick ID to name lookup
-const teamIdToName = {};
-for (const [name, id] of Object.entries(nflTeamMappings)) {
-  teamIdToName[id] = name;
-}
+// Create reverse mapping
+const reverseMapping = {};
+Object.entries(teamMappings).forEach(([abbr, full]) => {
+  reverseMapping[full.toLowerCase()] = abbr;
+  // Also map individual team names
+  const teamName = full.split(' ').pop();
+  reverseMapping[teamName.toLowerCase()] = abbr;
+});
 
-// Alternative team name mappings
-const alternativeNames = {
-  'Las Vegas Raiders': ['Oakland Raiders', 'Raiders'],
-  'Los Angeles Chargers': ['San Diego Chargers', 'Chargers'],
-  'Los Angeles Rams': ['St. Louis Rams', 'Rams'],
-  'Washington Commanders': ['Washington Redskins', 'Washington Football Team', 'Commanders'],
-  'Tampa Bay Buccaneers': ['Tampa Bay Bucs', 'Buccaneers', 'Bucs'],
-  'San Francisco 49ers': ['49ers', 'Niners']
+// Team RSS feeds for official announcements
+const teamRSSFeeds = {
+  'NE': 'https://www.patriots.com/rss/article',
+  'SF': 'https://www.49ers.com/news/rss',
+  'DAL': 'https://www.dallascowboys.com/news/rss',
+  'GB': 'https://www.packers.com/news/rss',
+  'KC': 'https://www.chiefs.com/news/rss',
+  'BAL': 'https://www.baltimoreravens.com/news/rss'
+  // Add more as needed
 };
 
-/**
- * Get team ID by name (handles alternative names)
- * @param {string} teamName - Team name to look up
- * @returns {string|null} Team ID or null if not found
- */
-function getTeamId(teamName) {
-  // Direct match
-  if (nflTeamMappings[teamName]) {
-    return nflTeamMappings[teamName];
-  }
-  
-  // Check alternative names
-  for (const [official, alternatives] of Object.entries(alternativeNames)) {
-    if (alternatives.includes(teamName)) {
-      return nflTeamMappings[official];
-    }
-  }
-  
-  // Case-insensitive search
-  for (const [name, id] of Object.entries(nflTeamMappings)) {
-    if (name.toLowerCase() === teamName.toLowerCase()) {
-      return id;
-    }
-  }
-  
-  return null;
-}
-
-/**
- * Get team name by ID
- * @param {string} teamId - Team ID to look up
- * @returns {string|null} Team name or null if not found
- */
-function getTeamName(teamId) {
-  return teamIdToName[teamId] || null;
-}
-
-/**
- * Check if a team exists in our mappings
- * @param {string} teamName - Team name to check
- * @returns {boolean} True if team exists
- */
-function teamExists(teamName) {
-  return getTeamId(teamName) !== null;
-}
-
-/**
- * Get all team IDs
- * @returns {Array<string>} Array of all team IDs
- */
-function getAllTeamIds() {
-  return Object.values(nflTeamMappings);
-}
-
-/**
- * Get all team names
- * @returns {Array<string>} Array of all team names
- */
-function getAllTeamNames() {
-  return Object.keys(nflTeamMappings);
-}
+// Allowed domains for official team news
+const officialTeamDomains = [
+  'patriots.com',
+  '49ers.com',
+  'dallascowboys.com',
+  'packers.com',
+  'chiefs.com',
+  'baltimoreravens.com',
+  'steelers.com',
+  'bengals.com',
+  'browns.com',
+  'texans.com',
+  'colts.com',
+  'jaguars.com',
+  'titans.com',
+  'broncos.com',
+  'raiders.com',
+  'chargers.com',
+  'giants.com',
+  'philadelphiaeagles.com',
+  'commanders.com',
+  'chicagobears.com',
+  'detroitlions.com',
+  'vikings.com',
+  'atlantafalcons.com',
+  'panthers.com',
+  'neworleanssaints.com',
+  'buccaneers.com',
+  'azcardinals.com',
+  'therams.com',
+  'seahawks.com'
+];
 
 module.exports = {
-  nflTeamMappings,
-  teamIdToName,
-  alternativeNames,
-  getTeamId,
-  getTeamName,
-  teamExists,
-  getAllTeamIds,
-  getAllTeamNames
+  teamMappings,
+  reverseMapping,
+  teamRSSFeeds,
+  officialTeamDomains,
+  
+  /**
+   * Get team abbreviation from full name or partial match
+   * @param {string} teamName - Team name to look up
+   * @returns {string|null} Team abbreviation or null
+   */
+  getTeamAbbr(teamName) {
+    if (!teamName) return null;
+    
+    const normalized = teamName.toLowerCase().trim();
+    
+    // Direct abbreviation match
+    if (teamMappings[teamName.toUpperCase()]) {
+      return teamName.toUpperCase();
+    }
+    
+    // Reverse lookup
+    if (reverseMapping[normalized]) {
+      return reverseMapping[normalized];
+    }
+    
+    // Partial match
+    for (const [full, abbr] of Object.entries(reverseMapping)) {
+      if (normalized.includes(full) || full.includes(normalized)) {
+        return abbr;
+      }
+    }
+    
+    return null;
+  },
+  
+  /**
+   * Get full team name from abbreviation
+   * @param {string} abbr - Team abbreviation
+   * @returns {string|null} Full team name or null
+   */
+  getTeamFullName(abbr) {
+    return teamMappings[abbr?.toUpperCase()] || null;
+  },
+  
+  /**
+   * Check if a domain is an official team domain
+   * @param {string} url - URL to check
+   * @returns {boolean} True if official team domain
+   */
+  isOfficialTeamDomain(url) {
+    if (!url) return false;
+    
+    const domain = url.toLowerCase();
+    return officialTeamDomains.some(official => domain.includes(official));
+  }
 };
