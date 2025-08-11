@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, ActivityType } = require('discord.js');
 const config = require('./config/config');
 const DailyUpdater = require('./utils/dailyUpdater');
 
@@ -9,11 +9,22 @@ const DailyUpdater = require('./utils/dailyUpdater');
  */
 class NFLDiscordBot {
   constructor() {
-    // Initialize Discord client with required intents
+    // Initialize Discord client with required intents and WebSocket configuration
     this.client = new Client({
       intents: [
         GatewayIntentBits.Guilds
-      ]
+      ],
+      // Enhanced WebSocket configuration for connection resilience
+      ws: {
+        timeout: 30_000,        // 30s handshake timeout (default is 15s)
+        reconnectTimeout: 5000, // 5s between reconnect attempts
+        retryLimit: 3           // Max reconnection attempts
+      },
+      // Additional connection options
+      rest: {
+        timeout: 15_000,        // 15s REST API timeout
+        retries: 3              // REST API retry attempts
+      }
     });
 
     this.dailyUpdater = new DailyUpdater(this.client);
@@ -35,7 +46,7 @@ class NFLDiscordBot {
       
       // Set bot activity status
       this.client.user.setActivity('NFL Scheduled Updates Only', { 
-        type: 'WATCHING' 
+        type: ActivityType.Watching 
       });
 
       // Start daily update scheduler
@@ -50,9 +61,41 @@ class NFLDiscordBot {
       return;
     });
 
+    // Enhanced connection and WebSocket event handling
+    this.client.on('debug', (info) => {
+      // Only log WebSocket and connection-related debug info
+      if (info.includes('WebSocket') || info.includes('heartbeat') || info.includes('gateway')) {
+        console.log('🔍 Discord Debug:', info);
+      }
+    });
+
+    // WebSocket connection events
+    this.client.ws.on('CONNECTING', () => {
+      console.log('🔄 Connecting to Discord WebSocket...');
+    });
+
+    this.client.ws.on('CONNECTED', () => {
+      console.log('✅ Connected to Discord WebSocket gateway');
+    });
+
+    this.client.ws.on('DISCONNECTED', () => {
+      console.log('🔌 Disconnected from Discord WebSocket');
+    });
+
+    this.client.ws.on('RECONNECTING', () => {
+      console.log('🔄 Reconnecting to Discord WebSocket...');
+    });
+
     // Error handling
     this.client.on('error', error => {
       console.error('❌ Discord client error:', error);
+      if (error.message.includes('handshake') || error.message.includes('timeout')) {
+        console.error('🔧 WebSocket connection issue - check network connectivity');
+        console.error('💡 Troubleshooting tips:');
+        console.error('   - Verify Discord token is valid');
+        console.error('   - Check internet connection');
+        console.error('   - Verify no firewall blocking Discord API');
+      }
     });
 
     this.client.on('warn', warning => {
@@ -71,15 +114,90 @@ class NFLDiscordBot {
 
 
   /**
-   * Start the Discord bot
+   * Validate network connectivity and Discord API access
+   */
+  async validateConnectivity() {
+    const https = require('https');
+    const dns = require('dns').promises;
+
+    console.log('🔍 Validating network connectivity...');
+
+    // Test DNS resolution for Discord gateway
+    try {
+      await dns.resolve('gateway.discord.gg');
+      console.log('✅ Discord gateway DNS resolution successful');
+    } catch (error) {
+      console.error('❌ Cannot resolve Discord gateway DNS:', error.message);
+      throw new Error('DNS resolution failed for Discord gateway');
+    }
+
+    // Test HTTPS connection to Discord API
+    return new Promise((resolve, reject) => {
+      const req = https.get('https://discord.com/api/v10/gateway', { timeout: 10000 }, (res) => {
+        if (res.statusCode === 200) {
+          console.log('✅ Discord API connectivity test successful');
+          resolve(true);
+        } else {
+          reject(new Error(`Discord API returned status ${res.statusCode}`));
+        }
+      });
+
+      req.on('error', (error) => {
+        console.error('❌ Discord API connectivity test failed:', error.message);
+        reject(error);
+      });
+
+      req.on('timeout', () => {
+        req.destroy();
+        reject(new Error('Discord API connectivity test timed out'));
+      });
+    });
+  }
+
+  /**
+   * Start the Discord bot with retry mechanism
    */
   async start() {
-    try {
-      console.log('🚀 Starting NFL Discord Bot...');
-      await this.client.login(config.discord.token);
-    } catch (error) {
-      console.error('❌ Failed to start bot:', error);
-      process.exit(1);
+    const maxRetries = 3;
+    let retryCount = 0;
+
+    while (retryCount < maxRetries) {
+      try {
+        console.log('🚀 Starting NFL Discord Bot...');
+        
+        // Pre-connection validation
+        await this.validateConnectivity();
+        
+        // Validate Discord token format
+        if (!config.discord.token || !config.discord.token.startsWith('MT')) {
+          throw new Error('Invalid Discord token format - token should start with MT');
+        }
+        
+        console.log('🔐 Discord token format validated');
+        console.log('🔄 Attempting to connect to Discord...');
+        
+        // Attempt to login
+        await this.client.login(config.discord.token);
+        return; // Success - exit retry loop
+        
+      } catch (error) {
+        retryCount++;
+        console.error(`❌ Bot startup attempt ${retryCount}/${maxRetries} failed:`, error.message);
+        
+        if (retryCount < maxRetries) {
+          const delay = Math.min(5000 * retryCount, 15000); // Exponential backoff, max 15s
+          console.log(`⏳ Retrying in ${delay/1000}s...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        } else {
+          console.error('❌ All startup attempts failed');
+          console.error('💡 Possible solutions:');
+          console.error('   - Check Discord token validity');
+          console.error('   - Verify internet connection');
+          console.error('   - Check if Discord API is experiencing outages');
+          console.error('   - Verify firewall/proxy settings');
+          process.exit(1);
+        }
+      }
     }
   }
 
@@ -93,7 +211,7 @@ class NFLDiscordBot {
     try {
       // Update bot status
       if (this.client.user) {
-        await this.client.user.setActivity('Shutting down...', { type: 'PLAYING' });
+        await this.client.user.setActivity('Shutting down...', { type: ActivityType.Playing });
       }
       
       // Close Discord connection
