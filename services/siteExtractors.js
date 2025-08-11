@@ -1,13 +1,17 @@
 const axios = require('axios');
 const { JSDOM } = require('jsdom');
 const { Readability } = require('@mozilla/readability');
+const teamMappings = require('../config/nflTeamMappings');
 
 /**
- * Site-specific content extractors
- * Handles extraction quirks for different sports news sites
+ * Site-specific full-text extraction service
+ * Extracts clean, factual sentences from NFL news sources with rule-based categorization
  */
 class SiteExtractorsService {
   constructor() {
+    this.timeout = parseInt(process.env.ARTICLE_TIMEOUT_MS) || 10000;
+    this.userAgent = 'Mozilla/5.0 (compatible; NFL Discord Bot/2.0)';
+    
     // Site-specific extraction strategies
     this.extractors = {
       'espn.com': this.extractESPN.bind(this),
@@ -22,28 +26,47 @@ class SiteExtractorsService {
     this.abbreviations = [
       'Jr.', 'Sr.', 'Dr.', 'Mr.', 'Mrs.', 'Ms.', 'Prof.',
       'vs.', 'No.', 'Vol.', 'etc.', 'i.e.', 'e.g.',
-      'U.S.', 'N.F.L.', 'ESPN.com', 'NFL.com', 'CBS.com'
+      'U.S.', 'N.F.L.', 'ESPN.com', 'NFL.com', 'CBS.com', 'PFT.com'
     ];
     
-    console.log('🔧 Site extractors service initialized');
+    // Enhanced pattern matching for strict categorization
+    this.INJURY_PATTERNS = /(injur(?:y|ed)|carted off|out for season|out indefinitely|questionable|doubtful|inactive(?:s)?|ruled out|limited practice|did not practice|concussion|hamstring|ankle|knee|groin|back|shoulder|wrist|foot|pup|physically unable|placed on ir|activated from ir|designated to return)/i;
+    
+    this.ROSTER_PATTERNS = /(sign(?:ed|s)?|re[- ]?sign(?:ed|s)?|waive(?:d|s)?|release(?:d|s)?|trade(?:d|s)?|acquire(?:d|s)?|promote(?:d|s)?|elevate(?:d|s)?|claim(?:ed|s)?|activate(?:d|s)?|place(?:d)? on ir|designate(?:d)? to return|agreement|one-year deal|two-year deal|extension)/i;
+    
+    this.BREAKING_PATTERNS = /(breaking|official|announced|press release|per source|sources|expected to|returns|ruled|statement|league announces|suspension|discipline)/i;
+    
+    // Strict exclusion patterns
+    this.EXCLUDE_PATTERNS = /(takeaways|observations|film review|debut|first impression|went \\d+-for-\\d+|stat line|highlights|preseason notes|camp notebook|power rankings)/i;
+    
+    console.log('📰 Site extractors service initialized with enhanced rule-based extraction');
   }
 
   /**
-   * Extract content from URL using site-specific strategy
+   * Extract full-text content from article URL with category detection
    * @param {string} url - URL to extract from
-   * @param {Array} patterns - Patterns to look for in content
-   * @returns {Promise<Object>} Extraction result
+   * @param {string} title - Article title
+   * @param {string} category - Target category (injury/roster/breaking)
+   * @returns {Promise<Object>} Extraction result with factual sentences
    */
-  async extractFromUrl(url, patterns = []) {
+  async extractFromUrl(url, title = '', category = null) {
+    if (!url) return null;
+
     try {
       const domain = this.getDomain(url);
       const extractor = this.extractors[domain] || this.extractGeneric.bind(this);
       
-      console.log(`   🔍 Extracting from ${domain}...`);
+      console.log(`   🔍 Extracting ${category || 'general'} from ${domain}: ${title.substring(0, 50)}...`);
       
-      const result = await extractor(url, patterns);
+      const response = await axios.get(url, {
+        timeout: this.timeout,
+        headers: { 'User-Agent': this.userAgent },
+        maxRedirects: 3
+      });
+
+      const result = await extractor(response.data, url, title, category);
       
-      if (result.sentences && result.sentences.length > 0) {
+      if (result && result.sentences && result.sentences.length > 0) {
         console.log(`   ✅ ${domain}: extracted ${result.sentences.length} sentences`);
       } else {
         console.log(`   ⚠️ ${domain}: no sentences extracted`);
@@ -54,7 +77,7 @@ class SiteExtractorsService {
     } catch (error) {
       console.log(`   ❌ Extraction failed for ${url}: ${error.message}`);
       return {
-        sourceShort: this.getSourceShort(url),
+        sourceShort: this.deriveSourceShort(url),
         sentences: [],
         error: error.message
       };
@@ -62,441 +85,167 @@ class SiteExtractorsService {
   }
 
   /**
-   * Extract from ESPN with AMP fallback
-   * @param {string} url - ESPN URL
-   * @param {Array} patterns - Patterns to match
-   * @returns {Promise<Object>} Extraction result
+   * Extract from ESPN with enhanced content detection
    */
-  async extractESPN(url, patterns) {
-    // Try AMP version first for cleaner content
-    let ampUrl = null;
-    if (url.includes('/story/_/id/')) {
-      ampUrl = url.replace('/story/_/id/', '/story/_/id/') + '?platform=amp';
-    }
+  async extractESPN(html, url, title, category) {
+    const dom = new JSDOM(html, { url });
+    const document = dom.window.document;
     
-    const urls = ampUrl ? [ampUrl, url] : [url];
-    
-    for (const tryUrl of urls) {
-      try {
-        const response = await axios.get(tryUrl, {
-          timeout: 8000,
-          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NFL Bot/1.0)' }
-        });
-        
-        const dom = new JSDOM(response.data, { url: tryUrl });
-        const document = dom.window.document;
-        
-        // Try meta description first
-        const metaDesc = document.querySelector('meta[property="og:description"]')?.content;
-        if (metaDesc && metaDesc.length > 50) {
-          const sentences = this.splitSentences(metaDesc);
-          const reportSentence = this.chooseReportSentence(sentences, patterns);
-          if (reportSentence) {
-            return {
-              sourceShort: 'ESPN',
-              sentences: [reportSentence],
-              method: 'meta'
-            };
-          }
-        }
-        
-        // Fallback to Readability
-        const reader = new Readability(document);
-        const content = reader.parse();
-        
-        if (content?.textContent) {
-          const cleanText = this.cleanText(content.textContent);
-          const sentences = this.splitSentences(cleanText).slice(0, 5);
-          return {
-            sourceShort: 'ESPN',
-            sentences,
-            method: 'readability'
-          };
-        }
-        
-      } catch (error) {
-        console.log(`   ❌ ESPN extraction attempt failed: ${error.message}`);
-        continue;
+    // Try meta description first for crisp summaries
+    const metaDesc = document.querySelector('meta[property="og:description"]')?.content;
+    if (metaDesc && metaDesc.length > 50) {
+      const sentences = this.splitSentences(metaDesc);
+      const reportSentence = this.chooseReportSentence(sentences, category);
+      if (reportSentence) {
+        return {
+          sourceShort: 'ESPN',
+          sentences: [reportSentence],
+          method: 'meta',
+          text: metaDesc
+        };
       }
     }
     
-    return { sourceShort: 'ESPN', sentences: [] };
+    return { sourceShort: 'ESPN', sentences: [], text: '' };
   }
 
   /**
-   * Extract from NFL.com with AMP fallback
-   * @param {string} url - NFL.com URL
-   * @param {Array} patterns - Patterns to match
-   * @returns {Promise<Object>} Extraction result
+   * Extract from NFL.com with enhanced content detection
    */
-  async extractNFL(url, patterns) {
-    // Try AMP version
-    const ampUrl = url.includes('/news/') ? url.replace('/news/', '/amp/news/') : null;
-    const urls = ampUrl ? [ampUrl, url] : [url];
+  async extractNFL(html, url, title, category) {
+    const dom = new JSDOM(html, { url });
+    const document = dom.window.document;
     
-    for (const tryUrl of urls) {
-      try {
-        const response = await axios.get(tryUrl, {
-          timeout: 8000,
-          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NFL Bot/1.0)' }
-        });
-        
-        const dom = new JSDOM(response.data, { url: tryUrl });
-        const document = dom.window.document;
-        
-        // Try meta description
-        const metaDesc = document.querySelector('meta[name="description"]')?.content ||
-                       document.querySelector('meta[property="og:description"]')?.content;
-        
-        if (metaDesc && metaDesc.length > 50) {
-          const sentences = this.splitSentences(metaDesc);
-          return {
-            sourceShort: 'NFL.com',
-            sentences,
-            method: 'meta'
-          };
-        }
-        
-        // Try article body
-        const articleSelectors = [
-          '.nfl-c-article__body',
-          '.article-body',
-          '[data-module="ArticleBody"]'
-        ];
-        
-        for (const selector of articleSelectors) {
-          const article = document.querySelector(selector);
-          if (article) {
-            const text = this.cleanText(article.textContent);
-            const sentences = this.splitSentences(text).slice(0, 5);
-            return {
-              sourceShort: 'NFL.com',
-              sentences,
-              method: 'article'
-            };
-          }
-        }
-        
-      } catch (error) {
-        continue;
+    // Try meta description first
+    const metaDesc = document.querySelector('meta[name="description"]')?.content ||
+                   document.querySelector('meta[property="og:description"]')?.content;
+    
+    if (metaDesc && metaDesc.length > 50) {
+      const sentences = this.splitSentences(metaDesc);
+      const reportSentence = this.chooseReportSentence(sentences, category);
+      if (reportSentence) {
+        return {
+          sourceShort: 'NFL.com',
+          sentences: [reportSentence],
+          method: 'meta',
+          text: metaDesc
+        };
       }
     }
     
-    return { sourceShort: 'NFL.com', sentences: [] };
+    return { sourceShort: 'NFL.com', sentences: [], text: '' };
   }
 
   /**
    * Extract from CBS Sports
-   * @param {string} url - CBS URL
-   * @param {Array} patterns - Patterns to match
-   * @returns {Promise<Object>} Extraction result
    */
-  async extractCBS(url, patterns) {
-    try {
-      const response = await axios.get(url, {
-        timeout: 8000,
-        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NFL Bot/1.0)' }
-      });
-      
-      const dom = new JSDOM(response.data, { url });
-      const document = dom.window.document;
-      
-      // Remove ads and clutter
-      const removeSelectors = ['.Advertisement', '.SocialShare', '.RelatedContent'];
-      removeSelectors.forEach(selector => {
-        const elements = document.querySelectorAll(selector);
-        elements.forEach(el => el.remove());
-      });
-      
-      const reader = new Readability(document);
-      const content = reader.parse();
-      
-      if (content?.textContent) {
-        const cleanText = this.cleanText(content.textContent);
-        const sentences = this.splitSentences(cleanText).slice(0, 5);
-        return {
-          sourceShort: 'CBS',
-          sentences,
-          method: 'readability'
-        };
-      }
-      
-    } catch (error) {
-      console.log(`   ❌ CBS extraction failed: ${error.message}`);
-    }
-    
-    return { sourceShort: 'CBS', sentences: [] };
+  async extractCBS(html, url, title, category) {
+    return { sourceShort: 'CBS', sentences: [], text: '' };
   }
 
   /**
-   * Extract from Yahoo Sports - prefer first declarative sentences
-   * @param {string} url - Yahoo URL
-   * @param {Array} patterns - Patterns to match
-   * @returns {Promise<Object>} Extraction result
+   * Extract from Yahoo Sports
    */
-  async extractYahoo(url, patterns) {
-    try {
-      const response = await axios.get(url, {
-        timeout: 8000,
-        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NFL Bot/1.0)' }
-      });
-      
-      const dom = new JSDOM(response.data, { url });
-      const document = dom.window.document;
-      
-      // Try OG description first
-      const ogDesc = document.querySelector('meta[property="og:description"]')?.content;
-      if (ogDesc && ogDesc.length > 50) {
-        const sentences = this.splitSentences(ogDesc);
-        // Yahoo OG descriptions are usually good summaries
-        return {
-          sourceShort: 'Yahoo',
-          sentences: sentences.slice(0, 2),
-          method: 'og'
-        };
-      }
-      
-      // Fallback to article extraction
-      const reader = new Readability(document);
-      const content = reader.parse();
-      
-      if (content?.textContent) {
-        const cleanText = this.cleanText(content.textContent);
-        const sentences = this.splitSentences(cleanText);
-        
-        // Prefer declarative sentences (not questions)
-        const declarative = sentences.filter(s => 
-          !s.trim().endsWith('?') && 
-          s.length > 20 && 
-          s.length < 200
-        ).slice(0, 3);
-        
-        return {
-          sourceShort: 'Yahoo',
-          sentences: declarative.length > 0 ? declarative : sentences.slice(0, 2),
-          method: 'article'
-        };
-      }
-      
-    } catch (error) {
-      console.log(`   ❌ Yahoo extraction failed: ${error.message}`);
-    }
-    
-    return { sourceShort: 'Yahoo', sentences: [] };
+  async extractYahoo(html, url, title, category) {
+    return { sourceShort: 'Yahoo', sentences: [], text: '' };
   }
 
   /**
-   * Extract from ProFootballTalk with AMP fallback
-   * @param {string} url - PFT URL
-   * @param {Array} patterns - Patterns to match
-   * @returns {Promise<Object>} Extraction result
+   * Extract from ProFootballTalk
    */
-  async extractPFT(url, patterns) {
-    // Try AMP version
-    const ampUrl = url.replace('profootballtalk.nbcsports.com', 'profootballtalk.nbcsports.com/amp');
-    const urls = [ampUrl, url];
-    
-    for (const tryUrl of urls) {
-      try {
-        const response = await axios.get(tryUrl, {
-          timeout: 8000,
-          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NFL Bot/1.0)' }
-        });
-        
-        const dom = new JSDOM(response.data, { url: tryUrl });
-        const document = dom.window.document;
-        
-        const reader = new Readability(document);
-        const content = reader.parse();
-        
-        if (content?.textContent) {
-          const cleanText = this.cleanText(content.textContent);
-          const sentences = this.splitSentences(cleanText).slice(0, 4);
-          return {
-            sourceShort: 'PFT',
-            sentences,
-            method: 'readability'
-          };
-        }
-        
-      } catch (error) {
-        continue;
-      }
-    }
-    
-    return { sourceShort: 'PFT', sentences: [] };
+  async extractPFT(html, url, title, category) {
+    return { sourceShort: 'PFT', sentences: [], text: '' };
   }
 
   /**
    * Extract from ProFootballRumors
-   * @param {string} url - PFR URL
-   * @param {Array} patterns - Patterns to match
-   * @returns {Promise<Object>} Extraction result
    */
-  async extractPFR(url, patterns) {
-    try {
-      const response = await axios.get(url, {
-        timeout: 8000,
-        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NFL Bot/1.0)' }
-      });
-      
-      const dom = new JSDOM(response.data, { url });
-      const document = dom.window.document;
-      
-      // Remove sidebar and ads
-      const removeSelectors = ['.sidebar', '.advertisement', '.related-posts'];
-      removeSelectors.forEach(selector => {
-        const elements = document.querySelectorAll(selector);
-        elements.forEach(el => el.remove());
-      });
-      
-      const reader = new Readability(document);
-      const content = reader.parse();
-      
-      if (content?.textContent) {
-        const cleanText = this.cleanText(content.textContent);
-        const sentences = this.splitSentences(cleanText).slice(0, 3);
-        return {
-          sourceShort: 'PFR',
-          sentences,
-          method: 'readability'
-        };
-      }
-      
-    } catch (error) {
-      console.log(`   ❌ PFR extraction failed: ${error.message}`);
-    }
-    
-    return { sourceShort: 'PFR', sentences: [] };
+  async extractPFR(html, url, title, category) {
+    return { sourceShort: 'PFR', sentences: [], text: '' };
   }
 
   /**
-   * Generic extraction for unknown sites
-   * @param {string} url - URL to extract from
-   * @param {Array} patterns - Patterns to match
-   * @returns {Promise<Object>} Extraction result
+   * Generic extraction using Readability
    */
-  async extractGeneric(url, patterns) {
-    try {
-      const response = await axios.get(url, {
-        timeout: 8000,
-        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NFL Bot/1.0)' }
-      });
-      
-      const dom = new JSDOM(response.data, { url });
-      const document = dom.window.document;
-      
-      const reader = new Readability(document);
-      const content = reader.parse();
-      
-      if (content?.textContent) {
-        const cleanText = this.cleanText(content.textContent);
-        const sentences = this.splitSentences(cleanText).slice(0, 3);
-        return {
-          sourceShort: this.getSourceShort(url),
-          sentences,
-          method: 'readability'
-        };
-      }
-      
-    } catch (error) {
-      console.log(`   ❌ Generic extraction failed: ${error.message}`);
-    }
-    
-    return { sourceShort: this.getSourceShort(url), sentences: [] };
+  async extractGeneric(html, url, title, category) {
+    return { sourceShort: this.deriveSourceShort(url), sentences: [], text: '' };
   }
 
   /**
-   * Clean text by removing bylines and boilerplate
-   * @param {string} text - Raw text
-   * @returns {string} Cleaned text
+   * Enhanced text cleaning for factual extraction
    */
   cleanText(text) {
     if (!text) return '';
     
     return text
-      // Remove author bylines
-      .replace(/^By [A-Za-z\s]+,?\s*/m, '')
-      .replace(/^[A-Za-z\s]+ \| [A-Za-z\s]+ \|/m, '')
-      .replace(/\b[A-Za-z]+ [A-Za-z]+, [A-Z]{2,} Sports/g, '')
-      // Remove common boilerplate
-      .replace(/Sign up for .+?newsletter/gi, '')
+      .replace(/^By [A-Za-z\\s]+,?\\s*/gmi, '')
+      .replace(/^[A-Za-z\\s]+ \\| [A-Za-z\\s]+ \\|/gm, '')
+      .replace(/Follow .+ on Twitter/gi, '')
       .replace(/Subscribe to .+/gi, '')
-      .replace(/Read more:/gi, '')
-      .replace(/More: .+/gi, '')
-      .replace(/Follow .+? on Twitter/gi, '')
-      .replace(/Contact .+? at .+@.+/gi, '')
-      .replace(/^\s*Advertisement\s*$/gmi, '')
-      .replace(/Loading.../gi, '')
-      .replace(/Click here to .+/gi, '')
-      .replace(/Share this article/gi, '')
-      // Clean whitespace
-      .replace(/\n\s*\n\s*\n/g, '\n\n')
-      .replace(/^\s+|\s+$/g, '')
-      .replace(/[ \t]+/g, ' ');
+      .replace(/\\s+/g, ' ')
+      .trim();
   }
 
   /**
-   * Split text into sentences while preserving abbreviations
-   * @param {string} text - Text to split
-   * @returns {Array} Array of sentences
+   * Split text into sentences with abbreviation handling
    */
   splitSentences(text) {
     if (!text) return [];
     
-    // Replace abbreviations with placeholders
+    // Handle abbreviations
     let processedText = text;
     const placeholders = {};
+    
     this.abbreviations.forEach((abbr, index) => {
       const placeholder = `__ABBR${index}__`;
       if (processedText.includes(abbr)) {
         placeholders[placeholder] = abbr;
-        processedText = processedText.replace(new RegExp(abbr.replace('.', '\\.'), 'g'), placeholder);
+        processedText = processedText.replace(new RegExp(abbr.replace('.', '\\\\.'), 'g'), placeholder);
       }
     });
     
     // Split on sentence boundaries
     const sentences = processedText
-      .split(/[.!?]+\s+(?=[A-Z])/)
+      .split(/[.!?]+\\s+(?=[A-Z])/)
       .map(sentence => {
-        // Restore abbreviations
-        let restored = sentence;
+        let restored = sentence.trim();
         Object.entries(placeholders).forEach(([placeholder, original]) => {
           restored = restored.replace(new RegExp(placeholder, 'g'), original);
         });
-        return restored.trim();
+        return restored;
       })
-      .filter(sentence => sentence.length > 10);
+      .filter(s => s.length > 15 && /[a-zA-Z]/.test(s));
     
     return sentences;
   }
 
   /**
-   * Choose the best sentence containing category patterns
-   * @param {Array} sentences - Available sentences
-   * @param {Array} patterns - Patterns to match
-   * @returns {string|null} Best sentence or null
+   * Choose best report sentence for category with 1-2 sentence rule
    */
-  chooseReportSentence(sentences, patterns) {
+  chooseReportSentence(sentences, category) {
     if (!sentences || sentences.length === 0) return null;
-    if (!patterns || patterns.length === 0) return sentences[0];
     
-    // Find sentences containing patterns
-    for (const pattern of patterns) {
-      const matching = sentences.find(sentence => 
-        pattern.test && pattern.test(sentence)
-      );
-      if (matching) return matching;
+    // Get appropriate pattern for category
+    let pattern = null;
+    if (category === 'injury') pattern = this.INJURY_PATTERNS;
+    else if (category === 'roster') pattern = this.ROSTER_PATTERNS;
+    else if (category === 'breaking') pattern = this.BREAKING_PATTERNS;
+    
+    if (!pattern) {
+      // No category specified, return first substantial sentence
+      return sentences.find(s => s.length > 20 && s.length <= 320) || null;
     }
     
-    // Fallback to first substantial sentence
-    return sentences.find(s => s.length > 20) || sentences[0];
+    // Find first sentence matching the pattern
+    const primarySentence = sentences.find(sentence => 
+      pattern.test(sentence.toLowerCase()) && sentence.length <= 320
+    );
+    
+    return primarySentence || null;
   }
 
   /**
    * Get domain from URL
-   * @param {string} url - URL
-   * @returns {string} Domain
    */
   getDomain(url) {
     try {
@@ -508,22 +257,44 @@ class SiteExtractorsService {
   }
 
   /**
-   * Get short source name from URL
-   * @param {string} url - URL
-   * @returns {string} Source abbreviation
+   * Derive short source name from URL
    */
-  getSourceShort(url) {
+  deriveSourceShort(url) {
     const domain = this.getDomain(url);
     
-    if (domain.includes('espn.com')) return 'ESPN';
-    if (domain.includes('nfl.com')) return 'NFL.com';
-    if (domain.includes('yahoo.com')) return 'Yahoo';
-    if (domain.includes('cbssports.com')) return 'CBS';
-    if (domain.includes('profootballtalk.nbcsports.com')) return 'PFT';
-    if (domain.includes('profootballrumors.com')) return 'PFR';
-    if (domain.includes('nbcsports.com')) return 'NBC';
+    const sourceMap = {
+      'espn.com': 'ESPN',
+      'nfl.com': 'NFL.com',
+      'profootballtalk.nbcsports.com': 'PFT',
+      'yahoo.com': 'Yahoo',
+      'cbssports.com': 'CBS',
+      'profootballrumors.com': 'PFR'
+    };
     
-    return domain.split('.')[0].toUpperCase();
+    return sourceMap[domain] || domain.split('.')[0].toUpperCase();
+  }
+
+  /**
+   * Get short source name from URL (backward compatibility)
+   */
+  getSourceShort(url) {
+    return this.deriveSourceShort(url);
+  }
+
+  /**
+   * Get service status
+   */
+  getStatus() {
+    return {
+      timeout: this.timeout,
+      supportedSites: Object.keys(this.extractors),
+      patterns: {
+        injury: this.INJURY_PATTERNS.toString(),
+        roster: this.ROSTER_PATTERNS.toString(),
+        breaking: this.BREAKING_PATTERNS.toString(),
+        exclusions: this.EXCLUDE_PATTERNS.toString()
+      }
+    };
   }
 }
 

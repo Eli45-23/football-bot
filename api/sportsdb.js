@@ -1,6 +1,7 @@
 const axios = require('axios');
 const config = require('../config/config');
 const { getTeamId } = require('../config/nflTeamMappings');
+const apiQueue = require('../lib/apiQueue');
 
 /**
  * TheSportsDB API Service
@@ -11,25 +12,31 @@ class SportsDBAPI {
     this.baseUrl = config.sportsdb.baseUrl;
     this.key = config.sportsdb.key;
     this.endpoints = config.sportsdb.endpoints;
+    this.nflLeagueId = config.sportsdb.nflLeagueId;
+    this.currentSeason = config.sportsdb.currentSeason;
   }
 
   /**
-   * Search for NFL team by name with rate limiting handling
+   * Search for NFL team by name with enhanced queue management
    * @param {string} teamName - Name of the team to search for
-   * @param {number} retryCount - Number of retries attempted
    * @returns {Object|null} Team data or null if not found
    */
-  async searchTeam(teamName, retryCount = 0) {
+  async searchTeam(teamName) {
     try {
       const url = `${this.baseUrl}/${this.key}${this.endpoints.searchTeams}`;
-      const response = await axios.get(url, {
+      const config = {
         params: { t: teamName },
         timeout: 10000 // 10 second timeout
+      };
+      
+      const data = await apiQueue.makeRequest(url, config, {
+        teamName,
+        requestType: 'searchTeam'
       });
 
-      if (response.data?.teams) {
+      if (data?.teams) {
         // Filter for NFL teams only
-        const nflTeam = response.data.teams.find(team => 
+        const nflTeam = data.teams.find(team => 
           team.strSport === 'American Football' && 
           team.strLeague === 'NFL'
         );
@@ -37,14 +44,6 @@ class SportsDBAPI {
       }
       return null;
     } catch (error) {
-      if (error.response?.status === 429 && retryCount < 3) {
-        // Rate limited - wait longer and retry
-        const waitTime = (retryCount + 1) * 2000; // 2s, 4s, 6s
-        console.warn(`⏳ Rate limited searching for ${teamName}, waiting ${waitTime}ms... (retry ${retryCount + 1}/3)`);
-        await new Promise(resolve => setTimeout(resolve, waitTime));
-        return this.searchTeam(teamName, retryCount + 1);
-      }
-      
       console.error(`Error searching for team ${teamName}:`, error.message);
       return null;
     }
@@ -225,6 +224,260 @@ class SportsDBAPI {
       console.error(`Error getting former teams for player ${playerId}:`, error.message);
       return [];
     }
+  }
+
+  /**
+   * Get league-wide NFL schedule with intelligent date windowing
+   * Primary method for getting all NFL games in a specified date range
+   * @param {Date} startDate - Start date for schedule window
+   * @param {Date} endDate - End date for schedule window  
+   * @returns {Object} Schedule data with games array and metadata
+   */
+  async getLeagueSchedule(startDate, endDate) {
+    try {
+      console.log(`📅 Fetching NFL league schedule: ${startDate.toISOString().split('T')[0]} to ${endDate.toISOString().split('T')[0]}`);
+      
+      // Try season endpoint first (most efficient - 1 API call)
+      const seasonData = await this.getSeasonSchedule(this.currentSeason);
+      if (seasonData && seasonData.length > 0) {
+        const filteredGames = this.filterGamesByDateRange(seasonData, startDate, endDate);
+        const normalizedGames = this.normalizeGameFormat(filteredGames);
+        
+        console.log(`✅ League schedule: ${filteredGames.length} games found in date range`);
+        return {
+          games: normalizedGames,
+          totalGames: normalizedGames.length,
+          source: 'League Season API',
+          apiCalls: 1,
+          dateRange: { start: startDate, end: endDate }
+        };
+      }
+      
+      // Fallback: Use upcoming + recent league endpoints (2 API calls)
+      console.log('🔄 Season endpoint failed, trying upcoming + recent league data...');
+      const [upcomingGames, recentGames] = await Promise.all([
+        this.getUpcomingLeagueGames(),
+        this.getRecentLeagueGames()
+      ]);
+      
+      const allGames = [...(upcomingGames || []), ...(recentGames || [])];
+      const filteredGames = this.filterGamesByDateRange(allGames, startDate, endDate);
+      const normalizedGames = this.normalizeGameFormat(filteredGames);
+      
+      console.log(`✅ League schedule (fallback): ${filteredGames.length} games found`);
+      return {
+        games: normalizedGames,
+        totalGames: normalizedGames.length,
+        source: 'League Upcoming+Recent API',
+        apiCalls: 2,
+        dateRange: { start: startDate, end: endDate }
+      };
+      
+    } catch (error) {
+      console.error('❌ League schedule fetch failed:', error.message);
+      
+      // Final fallback: team-by-team approach (legacy method)
+      console.log('🔄 Falling back to team-by-team schedule fetching...');
+      return await this.getTeamBasedSchedule(startDate, endDate);
+    }
+  }
+  
+  /**
+   * Get full NFL season schedule data with enhanced queue management
+   * @param {string} season - Season year (e.g., '2025')
+   * @returns {Array} Array of all season events
+   */
+  async getSeasonSchedule(season = this.currentSeason) {
+    try {
+      const url = `${this.baseUrl}/${this.key}${this.endpoints.eventsSeason}`;
+      const config = {
+        params: { id: this.nflLeagueId, s: season },
+        timeout: 15000 // 15 second timeout for large dataset
+      };
+      
+      const data = await apiQueue.makeRequest(url, config, {
+        requestType: 'seasonSchedule',
+        season: season,
+        teamName: 'NFL League' // For logging purposes
+      });
+      
+      return data?.events || [];
+    } catch (error) {
+      console.error(`Error getting season schedule for ${season}:`, error.message);
+      return [];
+    }
+  }
+  
+  /**
+   * Get upcoming NFL league games
+   * @returns {Array} Array of upcoming events
+   */
+  async getUpcomingLeagueGames() {
+    try {
+      const url = `${this.baseUrl}/${this.key}${this.endpoints.eventsNextLeague}`;
+      const response = await axios.get(url, {
+        params: { id: this.nflLeagueId },
+        timeout: 10000
+      });
+      
+      return response.data?.events || [];
+    } catch (error) {
+      console.error('Error getting upcoming league games:', error.message);
+      return [];
+    }
+  }
+  
+  /**
+   * Get recent NFL league games
+   * @returns {Array} Array of recent events
+   */
+  async getRecentLeagueGames() {
+    try {
+      const url = `${this.baseUrl}/${this.key}${this.endpoints.eventsPastLeague}`;
+      const response = await axios.get(url, {
+        params: { id: this.nflLeagueId },
+        timeout: 10000
+      });
+      
+      return response.data?.results || [];
+    } catch (error) {
+      console.error('Error getting recent league games:', error.message);
+      return [];
+    }
+  }
+  
+  /**
+   * Filter games array by date range
+   * @param {Array} games - Array of game objects
+   * @param {Date} startDate - Filter start date
+   * @param {Date} endDate - Filter end date
+   * @returns {Array} Filtered games array
+   */
+  filterGamesByDateRange(games, startDate, endDate) {
+    if (!games || games.length === 0) return [];
+    
+    return games.filter(game => {
+      try {
+        // Parse game date from various possible fields
+        const gameDate = this.parseGameDate(game);
+        if (!gameDate) return false;
+        
+        return gameDate >= startDate && gameDate <= endDate;
+      } catch (error) {
+        console.warn(`Error parsing game date for filtering:`, error.message);
+        return false;
+      }
+    });
+  }
+  
+  /**
+   * Parse game date from TheSportsDB event object
+   * @param {Object} game - Game/event object
+   * @returns {Date|null} Parsed date or null
+   */
+  parseGameDate(game) {
+    // Try various date fields that TheSportsDB might use
+    const dateFields = [
+      'dateEvent',
+      'strDate', 
+      'strTimestamp',
+      'dateEventLocal'
+    ];
+    
+    for (const field of dateFields) {
+      if (game[field]) {
+        const parsedDate = new Date(game[field]);
+        if (!isNaN(parsedDate.getTime())) {
+          return parsedDate;
+        }
+      }
+    }
+    
+    return null;
+  }
+  
+  /**
+   * Normalize game objects to consistent format for Discord display
+   * @param {Array} games - Array of raw game objects
+   * @returns {Array} Array of normalized game strings
+   */
+  normalizeGameFormat(games) {
+    if (!games || games.length === 0) return [];
+    
+    return games.map(game => {
+      try {
+        const homeTeam = game.strHomeTeam || 'TBD';
+        const awayTeam = game.strAwayTeam || 'TBD';
+        const gameDate = this.parseGameDate(game);
+        
+        let dateStr = 'TBD';
+        if (gameDate) {
+          // Format as "MMM DD, h:mm A ET"
+          const options = {
+            month: 'short',
+            day: 'numeric', 
+            hour: 'numeric',
+            minute: '2-digit',
+            timeZone: 'America/New_York'
+          };
+          dateStr = gameDate.toLocaleDateString('en-US', options);
+        }
+        
+        return `${awayTeam} @ ${homeTeam} – ${dateStr}`;
+      } catch (error) {
+        console.warn(`Error normalizing game format:`, error.message);
+        return `${game.strAwayTeam || 'TBD'} @ ${game.strHomeTeam || 'TBD'} – TBD`;
+      }
+    }).filter(gameStr => gameStr && !gameStr.includes('undefined'));
+  }
+  
+  /**
+   * Fallback method: Get schedule using team-by-team approach
+   * @param {Date} startDate - Start date
+   * @param {Date} endDate - End date
+   * @returns {Object} Schedule data from team aggregation
+   */
+  async getTeamBasedSchedule(startDate, endDate) {
+    console.log('🔄 Using team-by-team schedule fallback (legacy method)...');
+    
+    const allGames = [];
+    let apiCallCount = 0;
+    
+    // Get a subset of teams to avoid rate limits in fallback mode
+    const sampleTeams = config.nflTeams.slice(0, 8); // Sample 8 teams
+    
+    for (const teamName of sampleTeams) {
+      try {
+        const teamId = getTeamId(teamName);
+        if (!teamId) continue;
+        
+        const [nextEvents, lastEvents] = await Promise.all([
+          this.getNextEvents(teamId),
+          this.getLastEvents(teamId)
+        ]);
+        
+        allGames.push(...(nextEvents || []), ...(lastEvents || []));
+        apiCallCount += 2;
+        
+        // Small delay to avoid rate limits
+        await new Promise(resolve => setTimeout(resolve, 500));
+      } catch (error) {
+        console.warn(`Team fallback failed for ${teamName}:`, error.message);
+      }
+    }
+    
+    const filteredGames = this.filterGamesByDateRange(allGames, startDate, endDate);
+    const normalizedGames = this.normalizeGameFormat(filteredGames);
+    
+    console.log(`✅ Team-based schedule: ${normalizedGames.length} games from ${apiCallCount} API calls`);
+    return {
+      games: normalizedGames,
+      totalGames: normalizedGames.length,
+      source: 'Team-by-Team Fallback',
+      apiCalls: apiCallCount,
+      dateRange: { start: startDate, end: endDate },
+      fallbackUsed: true
+    };
   }
 
   /**

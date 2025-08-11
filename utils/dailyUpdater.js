@@ -4,11 +4,18 @@ const sportsdb = require('../api/sportsdb');
 const { fetchFallbackNews } = require('../services/rssFallback');
 const { getCache, setCache } = require('../lib/cache');
 const config = require('../config/config');
+const rssService = require('../services/rss');
+const articleCache = require('../utils/articleCache');
+const dedupHashService = require('../utils/dedupHash');
+const aggregateNews = require('../utils/aggregateNews');
+const gptSummarizer = require('../src/services/gptSummarizer.ts');
+const apiQueue = require('../lib/apiQueue');
 
 /**
  * NFL Scheduled Updates Service
  * Handles 3 daily scheduled updates (8 AM, 2 PM, 8 PM EST) 
  * Uses batched processing to avoid rate limits
+ * Integrates RSS feeds with schedule data
  * Posts categorized NFL updates to Discord in separate messages
  */
 class DailyUpdater {
@@ -96,13 +103,21 @@ class DailyUpdater {
       console.log(`🚀 Starting ${updateType} NFL update for ${timeStr}...`);
       console.log(`📊 Processing ${config.nflTeams.length} teams in batches of ${this.batchSize}...`);
       
-      // Collect NFL data using batched processing
+      // Collect NFL data using batched processing + RSS
       const nflData = await this.collectNFLDataBatched();
       
-      // Post categorized updates to Discord (4 separate messages)
+      // Post categorized updates to Discord (5 separate messages)
       await this.postStaggeredUpdatesToDiscord(nflData, timeStr, updateType);
       
+      // Process any deferred API requests with extended delays
+      await this.processAPIDeferialsInBackground(updateType);
+      
       this.lastRuns[updateType] = new Date();
+      
+      // Log detailed GPT metrics as requested
+      const gptMetrics = gptSummarizer.getDetailedMetrics();
+      console.log(`📊 ${gptMetrics}`);
+      
       console.log(`🎉 ${updateType} update completed successfully!`);
 
     } catch (error) {
@@ -113,7 +128,7 @@ class DailyUpdater {
   }
 
   /**
-   * Collect NFL data using batched processing to avoid rate limits
+   * Collect NFL data using batched processing + RSS integration
    * @returns {Object} Categorized NFL data
    */
   async collectNFLDataBatched() {
@@ -124,7 +139,9 @@ class DailyUpdater {
     const cachedFullData = await getCache(fullCacheKey);
     if (cachedFullData) {
       console.log('💾 Using cached full NFL dataset (24-hour cache)');
-      return cachedFullData;
+      // Still fetch RSS for fresh news even with cached schedule data
+      const rssData = await this.collectRSSData();
+      return this.mergeScheduleAndRSS(cachedFullData, rssData);
     }
     
     const nflData = {
@@ -139,6 +156,145 @@ class DailyUpdater {
       successfulRequests: 0
     };
 
+    // Collect schedule and RSS data in parallel
+    // NEW: Using league-wide schedule API instead of team-by-team
+    const [scheduleData, rssData] = await Promise.all([
+      this.collectLeagueScheduleWithWindowing(),
+      this.collectRSSData()
+    ]);
+
+    // Merge the data
+    const mergedData = this.mergeScheduleAndRSS(scheduleData, rssData);
+
+    // Cache the full dataset for 24 hours
+    await setCache(fullCacheKey, mergedData, 1440); // 24 hours = 1440 minutes
+    console.log('💾 Cached full NFL dataset for 24 hours');
+
+    return mergedData;
+  }
+
+  /**
+   * Collect RSS news data with full-text fact extraction
+   * @returns {Object} Categorized RSS data with extracted facts
+   */
+  async collectRSSData() {
+    try {
+      console.log('📰 Collecting RSS news with fact extraction...');
+      
+      // Use the new aggregated news service for fact-based extraction
+      const categorizedNews = await aggregateNews.getCategorizedNews(null, 24, 5);
+      
+      console.log(`✅ Fact extraction complete:`);
+      console.log(`   🏥 Injuries: ${categorizedNews.injuries.totalCount} found`);
+      console.log(`   🔁 Roster: ${categorizedNews.roster.totalCount} found`);
+      console.log(`   📰 Breaking: ${categorizedNews.breaking.totalCount} found`);
+      
+      // Log GPT status if enabled
+      if (process.env.GPT_ENABLED === 'true') {
+        const gptStatus = gptSummarizer.getStatus();
+        console.log(`   🤖 GPT: ${gptStatus.callsUsed}/${gptStatus.callsLimit} calls used`);
+      }
+      
+      return categorizedNews;
+      
+    } catch (error) {
+      console.error('❌ Error collecting RSS data:', error);
+      return {
+        injuries: { bullets: [], overflow: 0, totalCount: 0, source: 'RSS' },
+        roster: { bullets: [], overflow: 0, totalCount: 0, source: 'RSS' },
+        breaking: { bullets: [], overflow: 0, totalCount: 0, source: 'RSS' }
+      };
+    }
+  }
+
+  /**
+   * Collect league-wide schedule with intelligent 14-day windowing
+   * NEW METHOD: Replaces team-by-team approach with single league API call
+   * @returns {Object} Schedule data with windowing metadata
+   */
+  async collectLeagueScheduleWithWindowing() {
+    console.log('📅 Collecting NFL league schedule with intelligent windowing...');
+    
+    const now = moment().tz(config.timezone);
+    
+    // Phase 1: Try 7-day window first (±7 days from today)
+    let startDate = now.clone().subtract(7, 'days').startOf('day').toDate();
+    let endDate = now.clone().add(7, 'days').endOf('day').toDate();
+    
+    console.log(`📋 Phase 1: Trying 7-day window (${startDate.toISOString().split('T')[0]} to ${endDate.toISOString().split('T')[0]})`);
+    
+    let scheduleResult = await sportsdb.getLeagueSchedule(startDate, endDate);
+    let windowUsed = '7 days';
+    let windowExpanded = false;
+    
+    // Phase 2: Expand to 14 days if fewer than 10 games found
+    if (scheduleResult.totalGames < config.schedule.minGamesThreshold) {
+      console.log(`📋 Phase 2: Only ${scheduleResult.totalGames} games found, expanding to 14-day window...`);
+      
+      startDate = now.clone().subtract(14, 'days').startOf('day').toDate();
+      endDate = now.clone().add(14, 'days').endOf('day').toDate();
+      
+      scheduleResult = await sportsdb.getLeagueSchedule(startDate, endDate);
+      windowUsed = '14 days';
+      windowExpanded = true;
+    }
+    
+    // Sort games by date
+    const sortedGames = scheduleResult.games.sort((a, b) => {
+      try {
+        const dateA = this.parseGameDateFromString(a);
+        const dateB = this.parseGameDateFromString(b);
+        return dateA - dateB;
+      } catch {
+        return 0;
+      }
+    });
+    
+    console.log(`✅ League schedule collected:`);
+    console.log(`   🗓️ Window: ${windowUsed} (${windowExpanded ? 'expanded' : 'initial'})`); 
+    console.log(`   🏈 Games found: ${scheduleResult.totalGames}`);
+    console.log(`   📡 API calls: ${scheduleResult.apiCalls}`);
+    console.log(`   📊 Source: ${scheduleResult.source}`);
+    
+    return {
+      scheduledGames: sortedGames,
+      totalProcessed: 1, // League API call instead of 32 team calls
+      successfulRequests: 1,
+      unavailableTeams: [],
+      dataSource: scheduleResult.source,
+      fallbackUsed: scheduleResult.fallbackUsed || false,
+      apiCallsUsed: scheduleResult.apiCalls,
+      windowUsed,
+      windowExpanded,
+      dateRange: scheduleResult.dateRange
+    };
+  }
+  
+  /**
+   * Parse game date from formatted game string
+   * @param {string} gameStr - Formatted game string "Team @ Team – Date"
+   * @returns {Date} Parsed date
+   */
+  parseGameDateFromString(gameStr) {
+    try {
+      const dateMatch = gameStr.match(/–\s*(.+)$/);
+      if (dateMatch) {
+        return new Date(dateMatch[1]);
+      }
+    } catch (error) {
+      // Ignore parsing errors
+    }
+    return new Date(); // Default to now if parsing fails
+  }
+
+  /**
+   * Collect schedule data using existing batched processing (LEGACY FALLBACK)
+   * @param {Object} nflData - NFL data object to populate
+   * @returns {Object} Schedule data
+   */
+  async collectScheduleDataBatched(nflData) {
+    console.log('📅 Collecting schedule data from TheSportsDB...');
+    
     // Split teams into batches
     const batches = this.createTeamBatches(config.nflTeams, this.batchSize);
     console.log(`📦 Created ${batches.length} batches of ${this.batchSize} teams each`);
@@ -196,7 +352,7 @@ class DailyUpdater {
       nflData.dataSource = 'Cached/Fallback';
     }
 
-    console.log(`\n✅ Batched collection complete:`);
+    console.log(`\n✅ Schedule data collection complete:`);
     console.log(`   📊 Total teams: ${nflData.totalProcessed}`);
     console.log(`   ✅ Successful: ${nflData.successfulRequests}`);
     console.log(`   ⚠️ Unavailable: ${nflData.unavailableTeams.length}`);
@@ -204,11 +360,132 @@ class DailyUpdater {
       console.log(`   📝 Unavailable teams: ${nflData.unavailableTeams.join(', ')}`);
     }
 
-    // Cache the full dataset for 24 hours to reduce API calls
-    await setCache(fullCacheKey, nflData, 1440); // 24 hours = 1440 minutes
-    console.log('💾 Cached full NFL dataset for 24 hours');
-
     return nflData;
+  }
+
+  /**
+   * Merge schedule data from TheSportsDB with RSS news data
+   * @param {Object} scheduleData - Data from TheSportsDB
+   * @param {Object} rssData - Categorized RSS data
+   * @returns {Object} Merged data
+   */
+  mergeScheduleAndRSS(scheduleData, rssData) {
+    console.log('🔄 Merging league schedule and RSS data...');
+    
+    const merged = {
+      // Copy league schedule metadata
+      totalProcessed: scheduleData.totalProcessed,
+      successfulRequests: scheduleData.successfulRequests,
+      unavailableTeams: scheduleData.unavailableTeams,
+      fallbackUsed: scheduleData.fallbackUsed,
+      apiCallsUsed: scheduleData.apiCallsUsed,
+      windowUsed: scheduleData.windowUsed,
+      windowExpanded: scheduleData.windowExpanded,
+      
+      // Format RSS data for display (no legacy schedule items since we use league API)
+      injuries: this.formatCategory(rssData.injuries, []),
+      rosterChanges: this.formatCategory(rssData.roster, []),
+      breakingNews: this.formatCategory(rssData.breaking, []),
+      
+      // Format league schedule games
+      scheduledGames: this.formatScheduleCategory(scheduleData.scheduledGames || []),
+      
+      // Update data source info with league schedule details
+      dataSource: scheduleData.dataSource,
+      rssSource: 'RSS-FullText',
+      sourcesLine: this.buildSourcesLine(scheduleData)
+    };
+    
+    console.log(`✅ Merged data: ${merged.injuries.totalCount} injuries, ${merged.rosterChanges.totalCount} roster, ${merged.scheduledGames.totalCount} games, ${merged.breakingNews.totalCount} news`);
+    console.log(`   📊 Schedule: ${scheduleData.windowUsed} window, ${scheduleData.apiCallsUsed} API calls, ${scheduleData.dataSource}`);
+    
+    return merged;
+  }
+  
+  /**
+   * Build sources line with schedule and GPT information
+   * @param {Object} scheduleData - Schedule data with metadata
+   * @returns {string} Formatted sources line
+   */
+  buildSourcesLine(scheduleData) {
+    let sourceLine = '🗂 Sources: ';
+    
+    // Add schedule source
+    if (scheduleData.dataSource.includes('League')) {
+      sourceLine += 'TheSportsDB League API';
+    } else if (scheduleData.fallbackUsed) {
+      sourceLine += 'TheSportsDB (Fallback)';
+    } else {
+      sourceLine += 'TheSportsDB';
+    }
+    
+    // Add RSS sources
+    sourceLine += ' • ESPN • NFL.com • Yahoo • CBS Sports • ProFootballTalk';
+    
+    // Add detailed GPT information as requested
+    const gptStatus = gptSummarizer.getStatus();
+    if (gptStatus.enabled) {
+      sourceLine += ` • 🤖 GPT polish: ${gptStatus.callsUsed}/${gptStatus.callsLimit} calls (${gptStatus.model})`;
+    } else {
+      sourceLine += ' • Full-text rule-based analysis';
+    }
+    
+    // Add schedule window info
+    if (scheduleData.windowExpanded) {
+      sourceLine += ` • Schedule: ${scheduleData.windowUsed} (expanded)`;
+    } else {
+      sourceLine += ` • Schedule: ${scheduleData.windowUsed}`;
+    }
+    
+    return sourceLine;
+  }
+
+  /**
+   * Format RSS category data with fact bullets
+   * @param {Object} rssCategory - RSS category data with fact bullets
+   * @param {Array} legacyItems - Legacy items from TheSportsDB
+   * @returns {Object} Formatted category
+   */
+  formatCategory(rssCategory, legacyItems = []) {
+    // RSS category now contains fact bullets, not raw items
+    const rssBullets = rssCategory.bullets || [];
+    
+    // Combine fact bullets with any legacy items (prioritize RSS facts)
+    const allItems = [...rssBullets, ...legacyItems];
+    
+    // NEW: No truncation - pagination will handle large datasets
+    return {
+      items: allItems, // Show ALL items, pagination will chunk them
+      totalCount: allItems.length,
+      truncatedCount: 0, // No truncation with pagination system
+      source: rssBullets.length > 0 ? (legacyItems.length > 0 ? 'Mixed' : 'RSS') : 'TheSportsDB'
+    };
+  }
+
+  /**
+   * Format schedule category data - shows ALL games, no cap
+   * @param {Array} scheduleItems - Schedule items
+   * @returns {Object} Formatted schedule category
+   */
+  formatScheduleCategory(scheduleItems) {
+    // Sort schedule items by date if possible
+    const sortedItems = scheduleItems.sort((a, b) => {
+      try {
+        const dateA = new Date(a.match(/\w+ \d+, \d+:\d+ \w+/)?.[0] || '1970-01-01');
+        const dateB = new Date(b.match(/\w+ \d+, \d+:\d+ \w+/)?.[0] || '1970-01-01');
+        return dateA - dateB;
+      } catch {
+        return 0;
+      }
+    });
+    
+    // Return ALL items, no truncation
+    return {
+      items: sortedItems,
+      totalCount: sortedItems.length,
+      truncatedCount: 0, // No truncation for scheduled games
+      source: 'TheSportsDB'
+    };
   }
 
   /**
@@ -223,6 +500,20 @@ class DailyUpdater {
       batches.push(teams.slice(i, i + batchSize));
     }
     return batches;
+  }
+
+  /**
+   * Generic array chunking utility for pagination
+   * @param {Array} array - Array to chunk
+   * @param {number} chunkSize - Size of each chunk
+   * @returns {Array} Array of chunks
+   */
+  chunkArray(array, chunkSize) {
+    const chunks = [];
+    for (let i = 0; i < array.length; i += chunkSize) {
+      chunks.push(array.slice(i, i + chunkSize));
+    }
+    return chunks;
   }
 
   /**
@@ -318,13 +609,75 @@ class DailyUpdater {
   }
 
   /**
-   * Post staggered updates to Discord (4 separate messages)
+   * Post a category with chunking/pagination support
+   * @param {Object} channel - Discord channel
+   * @param {string} categoryTitle - Category title (e.g., "🏥 Injuries")
+   * @param {Object} categoryData - Category data with items array
+   * @param {number} itemsPerMessage - Items per message for this category
+   * @returns {Promise} Resolves when all messages posted
+   */
+  async postCategoryWithChunking(channel, categoryTitle, categoryData, itemsPerMessage) {
+    const items = categoryData.items || [];
+    const totalItems = items.length;
+    
+    if (totalItems === 0) {
+      // Post empty category section
+      const emptyEmbed = this.createNewSectionEmbed(categoryTitle, categoryData);
+      await channel.send({ embeds: [emptyEmbed] });
+      console.log(`   ${categoryTitle.split(' ')[0]} Posted empty ${categoryTitle.toLowerCase()}`);
+      return;
+    }
+    
+    if (totalItems <= itemsPerMessage) {
+      // Single message - no chunking needed
+      const singleEmbed = this.createNewSectionEmbed(categoryTitle, categoryData);
+      await channel.send({ embeds: [singleEmbed] });
+      console.log(`   ${categoryTitle.split(' ')[0]} Posted ${categoryTitle.toLowerCase()} (${totalItems} items in 1 message)`);
+    } else {
+      // Multiple messages - chunk the data
+      const chunks = this.chunkArray(items, itemsPerMessage);
+      
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        const chunkData = {
+          items: chunk,
+          totalCount: chunk.length,
+          truncatedCount: 0, // No truncation with pagination
+          source: categoryData.source
+        };
+        
+        // Add page number to title: "🏥 Injuries (1/3)"
+        const pagedTitle = `${categoryTitle} (${i + 1}/${chunks.length})`;
+        const chunkEmbed = this.createNewSectionEmbed(pagedTitle, chunkData);
+        await channel.send({ embeds: [chunkEmbed] });
+        
+        // Small delay between chunks
+        if (i < chunks.length - 1) {
+          await this.sleep(1000);
+        }
+      }
+      
+      console.log(`   ${categoryTitle.split(' ')[0]} Posted ${categoryTitle.toLowerCase()} (${totalItems} items in ${chunks.length} messages)`);
+    }
+  }
+
+  /**
+   * Post staggered updates to Discord with pagination support
    * @param {Object} nflData - Categorized NFL data
    * @param {string} timeStr - Formatted time string
    * @param {string} updateType - Type of update for logging
    */
   async postStaggeredUpdatesToDiscord(nflData, timeStr, updateType) {
     try {
+      // Check for duplicate payload first
+      const dedupResult = dedupHashService.checkAndRecord(nflData);
+      if (dedupResult.isDuplicate) {
+        console.log(`🚫 Skipping duplicate post (hash: ${dedupResult.hash}, window: ${dedupResult.windowMs/1000}s)`);
+        return;
+      }
+      
+      console.log(`✅ Payload hash verified: ${dedupResult.hash} (posting allowed)`);
+      
       if (!config.discord.nflUpdatesChannelId) {
         console.log('⚠️ NFL_UPDATES_CHANNEL_ID not set, logging to console:');
         this.logStaggeredUpdatesToConsole(nflData, timeStr, updateType);
@@ -340,39 +693,32 @@ class DailyUpdater {
 
       console.log(`📤 Starting staggered update posting to Discord (#${channel.name})...`);
 
-      // Header message
-      const headerEmbed = this.createHeaderEmbed(timeStr, nflData);
+      // Header message with run type
+      const headerEmbed = this.createHeaderEmbed(timeStr, updateType, nflData);
       await channel.send({ embeds: [headerEmbed] });
       console.log(`   📢 Posted header message`);
       await this.sleep(this.messageDelayMs);
 
-      // 1. Injuries Section
-      const injuryEmbed = this.createSectionEmbed('🏥 Injuries', nflData.injuries, nflData.unavailableTeams, 'injuries');
-      await channel.send({ embeds: [injuryEmbed] });
-      console.log(`   🏥 Posted injuries section`);
+      // 1. Injuries Section - NEW: With chunking (8 items per message)
+      await this.postCategoryWithChunking(channel, '🏥 Injuries', nflData.injuries, config.schedule.pagination.injuries);
       await this.sleep(this.messageDelayMs);
 
-      // 2. Roster Changes Section
-      const rosterEmbed = this.createSectionEmbed('🔁 Roster Changes', nflData.rosterChanges, nflData.unavailableTeams, 'roster');
-      await channel.send({ embeds: [rosterEmbed] });
-      console.log(`   🔁 Posted roster changes section`);
+      // 2. Roster Changes Section - NEW: With chunking (6 items per message)
+      await this.postCategoryWithChunking(channel, '🔁 Roster Changes', nflData.rosterChanges, config.schedule.pagination.roster);
       await this.sleep(this.messageDelayMs);
 
-      // 3. Scheduled Games Section
-      const gamesEmbed = this.createSectionEmbed('📅 Scheduled Games', nflData.scheduledGames, nflData.unavailableTeams, 'games');
-      await channel.send({ embeds: [gamesEmbed] });
-      console.log(`   📅 Posted scheduled games section`);
+      // 3. Scheduled Games Section - NEW: Using generic chunking method
+      await this.postCategoryWithChunking(channel, '📅 Scheduled Games', nflData.scheduledGames, config.schedule.pagination.games);
       await this.sleep(this.messageDelayMs);
 
-      // 4. Breaking News Section
-      const newsEmbed = this.createSectionEmbed('📰 Breaking News', nflData.breakingNews, nflData.unavailableTeams, 'news');
-      await channel.send({ embeds: [newsEmbed] });
-      console.log(`   📰 Posted breaking news section`);
+      // 4. Breaking News Section - NEW: With chunking (5 items per message)
+      await this.postCategoryWithChunking(channel, '📰 Breaking News', nflData.breakingNews, config.schedule.pagination.breaking);
+      await this.sleep(this.messageDelayMs);
 
-      // Footer with data source
-      const footerEmbed = this.createFooterEmbed(nflData);
+      // Footer with sources
+      const footerEmbed = this.createSourcesFooterEmbed(nflData);
       await channel.send({ embeds: [footerEmbed] });
-      console.log(`   🗂 Posted data source footer`);
+      console.log(`   🗺 Posted sources footer`);
 
       console.log(`✅ Staggered ${updateType} update posted successfully!`);
 
@@ -385,54 +731,97 @@ class DailyUpdater {
   /**
    * Create header embed for the update
    * @param {string} timeStr - Formatted time string
+   * @param {string} updateType - Type of update (morning/afternoon/evening)
    * @param {Object} nflData - NFL data for stats
    * @returns {Object} Discord embed
    */
-  createHeaderEmbed(timeStr, nflData) {
+  createHeaderEmbed(timeStr, updateType, nflData) {
     const { EmbedBuilder } = require('discord.js');
     
+    const runLabel = updateType.charAt(0).toUpperCase() + updateType.slice(1);
+    const title = `📢 NFL ${runLabel} Update – ${timeStr.split(' – ')[0]} – ${timeStr.split(' – ')[1]}`;
+    
+    // Build comprehensive description with GPT and schedule info
+    let description = this.buildHeaderDescription(nflData, updateType);
+    
     return new EmbedBuilder()
-      .setTitle(`📢 NFL Daily Update – ${timeStr}`)
-      .setDescription(`Processing ${nflData.totalProcessed} teams • ${nflData.successfulRequests} successful • ${nflData.unavailableTeams.length} unavailable`)
+      .setTitle(title)
+      .setDescription(description)
       .setColor(0x013369)
       .setTimestamp();
   }
+  
+  /**
+   * Build comprehensive header description with GPT status and schedule info
+   * @param {Object} nflData - NFL data with stats
+   * @param {string} updateType - Update type for context
+   * @returns {string} Formatted description
+   */
+  buildHeaderDescription(nflData, updateType) {
+    const descriptionParts = [];
+    
+    // Processing stats
+    if (nflData.totalProcessed) {
+      let processingStat = `Processing ${nflData.totalProcessed} teams • ${nflData.successfulRequests} successful`;
+      if (nflData.unavailableTeams && nflData.unavailableTeams.length > 0) {
+        processingStat += ` • ${nflData.unavailableTeams.length} unavailable`;
+      }
+      descriptionParts.push(processingStat);
+    }
+    
+    // GPT Status - Make GPT usage OBVIOUS as requested
+    const gptStatus = gptSummarizer.getStatus();
+    let gptLine = '';
+    if (gptStatus.enabled) {
+      gptLine = `🤖 AI polish: **ON** (${gptStatus.model}, calls used: ${gptStatus.callsUsed})`;
+    } else {
+      gptLine = '🤖 AI polish: **OFF**';
+    }
+    descriptionParts.push(gptLine);
+    
+    // Schedule Window Info
+    if (nflData.windowUsed) {
+      const windowText = nflData.windowExpanded 
+        ? `📅 Schedule: ${nflData.windowUsed} (expanded)`
+        : `📅 Schedule: ${nflData.windowUsed}`;
+      descriptionParts.push(windowText);
+    }
+    
+    // API Efficiency Stats (if available)
+    if (nflData.apiCallsUsed && nflData.apiCallsUsed <= 5) {
+      descriptionParts.push(`📡 API calls: ${nflData.apiCallsUsed} (League API)`);
+    }
+    
+    return descriptionParts.length > 0 
+      ? descriptionParts.join(' • ')
+      : 'Gathering latest NFL updates...';
+  }
 
   /**
-   * Create section embed for a specific category
+   * Create section embed for a specific category with new format
    * @param {string} title - Section title
-   * @param {Array} items - Items for this section
-   * @param {Array} unavailableTeams - Teams that couldn't be processed
-   * @param {string} type - Section type for unavailable message
+   * @param {Object} categoryData - Category data with items, counts, etc.
    * @returns {Object} Discord embed
    */
-  createSectionEmbed(title, items, unavailableTeams, type) {
+  createNewSectionEmbed(title, categoryData) {
     const { EmbedBuilder } = require('discord.js');
     
     let content = '';
     
-    if (items.length > 0) {
-      content = items.slice(0, 15).map(item => `• ${item}`).join('\n');
-      if (items.length > 15) {
-        content += `\n• ... and ${items.length - 15} more items`;
-      }
+    if (categoryData.items && categoryData.items.length > 0) {
+      content = categoryData.items.map(item => `• ${item}`).join('\n');
+      
+      // REMOVED: Truncation logic - pagination system handles large datasets
+      // No more "(+N more)" messages needed
     } else {
       // Default messages for empty sections
       const defaultMessages = {
-        injuries: '• No reported injuries',
-        roster: '• No roster changes reported', 
-        games: '• No upcoming games scheduled',
-        news: '• No breaking news at this time'
+        '🏥 Injuries': '• No updates',
+        '🔁 Roster Changes': '• No updates',
+        '📅 Scheduled Games': '• No upcoming games',
+        '📰 Breaking News': '• No updates'
       };
-      content = defaultMessages[type] || '• No updates available';
-    }
-
-    // Add unavailable teams message for each section
-    if (unavailableTeams.length > 0) {
-      content += `\n\n⚠️ Data unavailable (rate limits): ${unavailableTeams.slice(0, 5).join(', ')}`;
-      if (unavailableTeams.length > 5) {
-        content += ` and ${unavailableTeams.length - 5} more`;
-      }
+      content = defaultMessages[title] || '• No updates';
     }
 
     return new EmbedBuilder()
@@ -441,20 +830,28 @@ class DailyUpdater {
       .setColor(0x013369);
   }
 
+  // REMOVED: postScheduledGamesWithChunking - replaced by generic postCategoryWithChunking method
+
   /**
-   * Create footer embed with data source info
+   * Create sources footer embed
    * @param {Object} nflData - NFL data
    * @returns {Object} Discord embed
    */
-  createFooterEmbed(nflData) {
+  createSourcesFooterEmbed(nflData) {
     const { EmbedBuilder } = require('discord.js');
     
-    const sourceText = nflData.fallbackUsed 
-      ? `⚠️ ${nflData.dataSource} - Some data temporarily unavailable due to rate limits`
-      : `🗂 Data Source: ${nflData.dataSource}`;
+    const sourceText = nflData.sourcesLine || '🗺 Sources: TheSportsDB';
+    
+    let description = sourceText;
+    if (nflData.unavailableTeams && nflData.unavailableTeams.length > 0) {
+      description += `\n\n⚠️ Some team data unavailable due to rate limits: ${nflData.unavailableTeams.slice(0, 5).join(', ')}`;
+      if (nflData.unavailableTeams.length > 5) {
+        description += ` (+${nflData.unavailableTeams.length - 5} more)`;
+      }
+    }
 
     return new EmbedBuilder()
-      .setDescription(sourceText)
+      .setDescription(description)
       .setColor(0x666666)
       .setTimestamp();
   }
@@ -469,54 +866,58 @@ class DailyUpdater {
     console.log('\n' + '='.repeat(60));
     console.log(`🏈 NFL ${updateType.toUpperCase()} UPDATE – ${timeStr}`);
     console.log('='.repeat(60));
-    console.log(`📊 ${nflData.totalProcessed} teams • ${nflData.successfulRequests} successful • ${nflData.unavailableTeams.length} unavailable`);
+    if (nflData.totalProcessed) {
+      console.log(`📊 ${nflData.totalProcessed} teams • ${nflData.successfulRequests} successful • ${nflData.unavailableTeams?.length || 0} unavailable`);
+    }
 
     // Injuries
     console.log('\n🏥 INJURIES');
     console.log('-'.repeat(30));
-    if (nflData.injuries.length > 0) {
-      nflData.injuries.slice(0, 10).forEach(injury => console.log(`• ${injury}`));
+    if (nflData.injuries?.items?.length > 0) {
+      nflData.injuries.items.forEach(injury => console.log(`• ${injury}`));
+      // REMOVED: Truncation count display - pagination handles all items
     } else {
-      console.log('• No reported injuries');
+      console.log('• No updates');
     }
 
     // Roster Changes
     console.log('\n🔁 ROSTER CHANGES');
     console.log('-'.repeat(30));
-    if (nflData.rosterChanges.length > 0) {
-      nflData.rosterChanges.slice(0, 10).forEach(change => console.log(`• ${change}`));
+    if (nflData.rosterChanges?.items?.length > 0) {
+      nflData.rosterChanges.items.forEach(change => console.log(`• ${change}`));
+      // REMOVED: Truncation count display - pagination handles all items
     } else {
-      console.log('• No roster changes reported');
+      console.log('• No updates');
     }
 
-    // Scheduled Games
+    // Scheduled Games - show all without truncation notice
     console.log('\n📅 SCHEDULED GAMES');
     console.log('-'.repeat(30));
-    if (nflData.scheduledGames.length > 0) {
-      nflData.scheduledGames.slice(0, 10).forEach(game => console.log(`• ${game}`));
+    if (nflData.scheduledGames?.items?.length > 0) {
+      nflData.scheduledGames.items.forEach(game => console.log(`• ${game}`));
+      console.log(`Total games: ${nflData.scheduledGames.totalCount}`);
     } else {
-      console.log('• No upcoming games scheduled');
+      console.log('• No upcoming games');
     }
 
     // Breaking News
     console.log('\n📰 BREAKING NEWS');
     console.log('-'.repeat(30));
-    if (nflData.breakingNews.length > 0) {
-      nflData.breakingNews.slice(0, 10).forEach(news => console.log(`• ${news}`));
+    if (nflData.breakingNews?.items?.length > 0) {
+      nflData.breakingNews.items.forEach(news => console.log(`• ${news}`));
+      // REMOVED: Truncation count display - pagination handles all items
     } else {
-      console.log('• No breaking news at this time');
+      console.log('• No updates');
     }
 
     // Unavailable teams
-    if (nflData.unavailableTeams.length > 0) {
+    if (nflData.unavailableTeams?.length > 0) {
       console.log('\n⚠️ UNAVAILABLE TEAMS (Rate Limited)');
       console.log('-'.repeat(30));
       console.log(nflData.unavailableTeams.join(', '));
     }
 
-    const sourceText = nflData.fallbackUsed 
-      ? `⚠️ ${nflData.dataSource} - Some data temporarily unavailable`
-      : `🗂 Data Source: ${nflData.dataSource}`;
+    const sourceText = nflData.sourcesLine || '🗺 Data Sources: TheSportsDB';
     console.log(`\n${sourceText}`);
     
     console.log('\n' + '='.repeat(60) + '\n');
@@ -532,10 +933,83 @@ class DailyUpdater {
   }
 
   /**
+   * Process deferred API requests in background with extended delays
+   * @param {string} updateType - Type of update for logging
+   */
+  async processAPIDeferialsInBackground(updateType) {
+    try {
+      console.log('🔄 Processing deferred API requests...');
+      
+      const deferredResults = await apiQueue.processDeferredItems();
+      
+      if (deferredResults.processed > 0) {
+        console.log(`✅ Deferred processing complete: ${deferredResults.successful}/${deferredResults.processed} successful`);
+        
+        // If some items still failed, post a warning to Discord
+        if (deferredResults.stillFailed > 0) {
+          await this.postDeferredFailureWarning(deferredResults, updateType);
+        }
+        
+        // Log final queue stats
+        const queueStats = await apiQueue.getStats();
+        console.log(`📊 API Queue Stats: ${queueStats.queue.successRate} success rate, ${queueStats.deferred.failedItems} final failures`);
+      }
+      
+    } catch (error) {
+      console.error('❌ Error processing deferred API requests:', error.message);
+    }
+  }
+  
+  /**
+   * Post warning about items that still failed after deferred processing
+   * @param {Object} deferredResults - Results from deferred processing
+   * @param {string} updateType - Update type for context
+   */
+  async postDeferredFailureWarning(deferredResults, updateType) {
+    try {
+      if (!config.discord.nflUpdatesChannelId) {
+        console.log('⚠️ NFL_UPDATES_CHANNEL_ID not set, skipping deferred failure warning');
+        return;
+      }
+      
+      const channel = await this.client.channels.fetch(config.discord.nflUpdatesChannelId);
+      if (!channel) {
+        console.log('⚠️ Could not find NFL updates channel for deferred failure warning');
+        return;
+      }
+      
+      const stillFailedItems = apiQueue.getStillFailedItems();
+      const failedTeamNames = stillFailedItems.map(item => item.teamName).filter(name => name);
+      
+      if (failedTeamNames.length === 0) return;
+      
+      // Create warning embed
+      const { EmbedBuilder } = require('discord.js');
+      
+      const warningEmbed = new EmbedBuilder()
+        .setTitle('⚠️ Temporary Data Delays')
+        .setDescription(`Some team data was temporarily unavailable during the ${updateType} update. Auto-retry is running in background.`)
+        .addFields({
+          name: 'Affected Teams',
+          value: failedTeamNames.slice(0, 8).join(', ') + (failedTeamNames.length > 8 ? ` (+${failedTeamNames.length - 8} more)` : ''),
+          inline: false
+        })
+        .setColor(0xFFA500) // Orange color for warnings
+        .setTimestamp();
+      
+      await channel.send({ embeds: [warningEmbed] });
+      console.log(`⚠️ Posted deferred failure warning for ${failedTeamNames.length} teams`);
+      
+    } catch (error) {
+      console.error('❌ Error posting deferred failure warning:', error.message);
+    }
+  }
+
+  /**
    * Manual trigger for testing updates
    */
   async testUpdate() {
-    console.log('🧪 Running test NFL update with batched processing...');
+    console.log('🧪 Running test NFL update with RSS integration...');
     await this.runScheduledUpdate('test');
   }
 
@@ -554,7 +1028,11 @@ class DailyUpdater {
       batchSize: this.batchSize,
       batchDelayMs: this.batchDelayMs,
       teamDelayMs: this.teamDelayMs,
-      messageDelayMs: this.messageDelayMs
+      messageDelayMs: this.messageDelayMs,
+      rssEnabled: true,
+      dedupEnabled: true,
+      gptEnabled: process.env.GPT_ENABLED === 'true',
+      gptStatus: gptSummarizer.getStatus()
     };
   }
 

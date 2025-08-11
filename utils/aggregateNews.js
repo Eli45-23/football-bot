@@ -1,99 +1,276 @@
 const espnInjuries = require('../services/espnInjuries');
 const pfrTransactions = require('../services/pfrTransactions');
-const rssFullText = require('../services/rssFullText');
+const siteExtractors = require('../services/siteExtractors');
 const newsClassifier = require('../services/newsClassifier');
+const rssFullText = require('../services/rssFullText');
 const { getCache, setCache } = require('../lib/cache');
+const gptSummarizer = require('../src/services/gptSummarizer.ts');
 
 /**
- * News aggregation service with STRICT source routing
- * GOALS: Build categories in order with source-specific extraction
- * 
- * Order: (a) Injuries: ESPN table + injury news (b) Roster: PFR + teams (c) Breaking: remaining
+ * Enhanced News Aggregation Service with WIDENED LOOKBACK and FALLBACKS
+ * Ensures every section has factual content through automatic lookback expansion
  */
 class NewsAggregationService {
   constructor() {
-    this.cacheKeyPrefix = 'news-aggregate:';
-    this.seenUrlsCacheKey = 'news-aggregate:seen-urls';
+    this.cacheKeyPrefix = 'news-aggregate-enhanced:';
     
-    console.log('📊 News aggregation service initialized with source routing');
+    // Default lookback hours by run type
+    this.DEFAULT_LOOKBACK = {
+      morning: 24,
+      afternoon: 12,
+      evening: 12
+    };
+    
+    // Widened lookback when section is sparse (<2 items)
+    this.FALLBACK_LOOKBACK = {
+      morning: 48,
+      afternoon: 18, // +6h from 12h
+      evening: 18    // +6h from 12h
+    };
+    
+    // Category sources (strict allowlists)
+    this.CATEGORY_SOURCES = {
+      injuries: ['espn.com', 'nfl.com', 'profootballtalk.nbcsports.com', 'yahoo.com', 'cbssports.com'],
+      roster: ['profootballrumors.com', 'nfl.com'], // + team feeds if configured
+      breaking: ['espn.com', 'nfl.com', 'profootballtalk.nbcsports.com', 'yahoo.com', 'cbssports.com']
+    };
+    
+    console.log('📊 Enhanced news aggregation service initialized with widened lookback');
   }
 
   /**
-   * Get categorized news using STRICT source routing
+   * Get categorized news with WIDENED LOOKBACK and FALLBACKS
    * @param {Array} feedUrls - Not used, sources are predefined
-   * @param {number} lookbackHours - Hours to look back
-   * @param {Object} caps - Category caps {injuries: 8, roster: 8, breaking: 6}
-   * @returns {Promise<Object>} Categorized news with clean bullets
+   * @param {number} lookbackHours - Base lookback hours
+   * @param {string} runType - morning/afternoon/evening
+   * @returns {Promise<Object>} Categorized news with full factual bullets
    */
-  async getCategorizedNews(feedUrls = null, lookbackHours = 24, cap = 5) {
-    // Use new caps structure but maintain backward compatibility
-    const categoryCaps = typeof cap === 'object' ? cap : { injuries: 8, roster: 8, breaking: 6 };
+  async getCategorizedNews(feedUrls = null, lookbackHours = null, runType = 'morning') {
+    // Reset GPT call counter at start of each run
+    gptSummarizer.resetCallCounter();
+    // Determine base lookback hours
+    const baseLookback = lookbackHours || this.DEFAULT_LOOKBACK[runType] || 24;
     
-    console.log(`📰 Aggregating with source routing (${lookbackHours}h lookback)...`);
-    console.log(`   🎯 Caps: ${categoryCaps.injuries} injuries, ${categoryCaps.roster} roster, ${categoryCaps.breaking} breaking`);
+    console.log(`📰 Enhanced aggregation starting (${runType} run, ${baseLookback}h base lookback)...`);
     
     try {
       const result = {
-        injuries: { bullets: [], totalCount: 0, overflow: 0 },
-        roster: { bullets: [], totalCount: 0, overflow: 0 },
-        breaking: { bullets: [], totalCount: 0, overflow: 0 }
+        injuries: { bullets: [], totalCount: 0, overflow: 0, source: 'None' },
+        roster: { bullets: [], totalCount: 0, overflow: 0, source: 'None' },
+        breaking: { bullets: [], totalCount: 0, overflow: 0, source: 'None' },
+        runType,
+        baseLookback,
+        fallbacksUsed: []
       };
 
-      // (A) INJURIES: ESPN injuries table + injury-marked news from allowed sources
-      console.log('🏥 Processing injuries...');
-      const injuryBullets = await this.processInjuries(lookbackHours, categoryCaps.injuries);
-      result.injuries = {
-        bullets: injuryBullets.slice(0, categoryCaps.injuries),
-        totalCount: injuryBullets.length,
-        overflow: Math.max(0, injuryBullets.length - categoryCaps.injuries)
-      };
+      // (A) INJURIES: ESPN table + injury news with fallback
+      console.log('🏥 Processing injuries with fallback support...');
+      const injuryResult = await this.processInjuriesWithFallback(baseLookback, runType);
+      result.injuries = injuryResult.data;
+      if (injuryResult.fallbackUsed) {
+        result.fallbacksUsed.push(`injuries: expanded to ${injuryResult.finalLookback}h`);
+      }
       
-      // (B) ROSTER CHANGES: PFR transactions + team press releases
-      console.log('🔁 Processing roster changes...');  
-      const rosterBullets = await this.processRosterChanges(lookbackHours, categoryCaps.roster);
-      result.roster = {
-        bullets: rosterBullets.slice(0, categoryCaps.roster),
-        totalCount: rosterBullets.length,
-        overflow: Math.max(0, rosterBullets.length - categoryCaps.roster)
-      };
+      // (B) ROSTER CHANGES: PFR transactions + team feeds with fallback
+      console.log('🔁 Processing roster changes with fallback support...');  
+      const rosterResult = await this.processRosterWithFallback(baseLookback, runType);
+      result.roster = rosterResult.data;
+      if (rosterResult.fallbackUsed) {
+        result.fallbacksUsed.push(`roster: expanded to ${rosterResult.finalLookback}h`);
+      }
       
-      // (C) BREAKING NEWS: remaining classified items not in above categories
-      console.log('📰 Processing breaking news...');
-      const breakingBullets = await this.processBreakingNews(lookbackHours, categoryCaps.breaking);
-      result.breaking = {
-        bullets: breakingBullets.slice(0, categoryCaps.breaking),
-        totalCount: breakingBullets.length,
-        overflow: Math.max(0, breakingBullets.length - categoryCaps.breaking)
-      };
+      // (C) BREAKING NEWS: remaining items with fallback
+      console.log('📰 Processing breaking news with fallback support...');
+      const breakingResult = await this.processBreakingWithFallback(baseLookback, runType);
+      result.breaking = breakingResult.data;
+      if (breakingResult.fallbackUsed) {
+        result.fallbacksUsed.push(`breaking: expanded to ${breakingResult.finalLookback}h`);
+      }
 
-      console.log(`✅ Source routing complete:`);
-      console.log(`   🏥 Injuries: ${result.injuries.totalCount} found → ${result.injuries.bullets.length} used`);
-      console.log(`   🔁 Roster: ${result.roster.totalCount} found → ${result.roster.bullets.length} used`);
-      console.log(`   📰 Breaking: ${result.breaking.totalCount} found → ${result.breaking.bullets.length} used`);
+      console.log(`✅ Enhanced aggregation complete:`);
+      console.log(`   🏥 Injuries: ${result.injuries.totalCount} found → ${result.injuries.bullets.length} used (${result.injuries.source})`);
+      console.log(`   🔁 Roster: ${result.roster.totalCount} found → ${result.roster.bullets.length} used (${result.roster.source})`);
+      console.log(`   📰 Breaking: ${result.breaking.totalCount} found → ${result.breaking.bullets.length} used (${result.breaking.source})`);
+      if (result.fallbacksUsed.length > 0) {
+        console.log(`   🔄 Fallbacks: ${result.fallbacksUsed.join(', ')}`);
+      }
 
       return result;
 
     } catch (error) {
-      console.error(`❌ News aggregation failed: ${error.message}`);
+      console.error(`❌ Enhanced aggregation failed: ${error.message}`);
       return this.getEmptyResult();
     }
   }
 
   /**
-   * Process injuries: ESPN table + injury-marked news
-   * @param {number} lookbackHours - Hours to look back
-   * @param {number} cap - Maximum bullets to return
-   * @returns {Promise<Array>} Array of injury bullet strings
+   * Process injuries with automatic fallback expansion
+   * @param {number} baseLookback - Base lookback hours
+   * @param {string} runType - Run type for fallback calculation
+   * @returns {Promise<Object>} Result with fallback info
    */
-  async processInjuries(lookbackHours, cap) {
+  async processInjuriesWithFallback(baseLookback, runType) {
+    let lookback = baseLookback;
+    let fallbackUsed = false;
+    
+    // Try base lookback first
+    console.log(`   📋 Trying injuries with ${lookback}h lookback...`);
+    let result = await this.processInjuries(lookback);
+    
+    // Apply GPT enhancement if enabled
+    if (process.env.GPT_ENABLED === 'true') {
+      result = await this.enhanceWithGPT(result, 'injuries', lookback);
+    }
+    
+    // If sparse (<2 items), expand lookback
+    if (result.bullets.length < 2) {
+      const fallbackLookback = this.FALLBACK_LOOKBACK[runType] || 48;
+      console.log(`   🔄 Injuries sparse (${result.bullets.length} items), expanding to ${fallbackLookback}h...`);
+      
+      const fallbackResult = await this.processInjuries(fallbackLookback);
+      if (fallbackResult.bullets.length > result.bullets.length) {
+        result = fallbackResult;
+        lookback = fallbackLookback;
+        fallbackUsed = true;
+        console.log(`   ✅ Fallback successful: ${result.bullets.length} items found`);
+      }
+    }
+    
+    // Still sparse? Try team feeds if configured
+    if (result.bullets.length < 2) {
+      console.log(`   🏈 Still sparse, checking team allowlist feeds...`);
+      const teamResult = await this.addTeamFeedInjuries(result, lookback);
+      if (teamResult.bullets.length > result.bullets.length) {
+        result = teamResult;
+        console.log(`   ✅ Team feeds added: ${result.bullets.length} total items`);
+      }
+    }
+    
+    return {
+      data: result,
+      fallbackUsed,
+      finalLookback: lookback
+    };
+  }
+
+  /**
+   * Process roster changes with automatic fallback expansion
+   * @param {number} baseLookback - Base lookback hours
+   * @param {string} runType - Run type for fallback calculation
+   * @returns {Promise<Object>} Result with fallback info
+   */
+  async processRosterWithFallback(baseLookback, runType) {
+    let lookback = baseLookback;
+    let fallbackUsed = false;
+    
+    // Try base lookback first
+    console.log(`   📄 Trying roster with ${lookback}h lookback...`);
+    let result = await this.processRosterChanges(lookback);
+    
+    // Apply GPT enhancement if enabled
+    if (process.env.GPT_ENABLED === 'true') {
+      result = await this.enhanceWithGPT(result, 'roster', lookback);
+    }
+    
+    // If sparse (<2 items), expand lookback
+    if (result.bullets.length < 2) {
+      const fallbackLookback = this.FALLBACK_LOOKBACK[runType] || 48;
+      console.log(`   🔄 Roster sparse (${result.bullets.length} items), expanding to ${fallbackLookback}h...`);
+      
+      const fallbackResult = await this.processRosterChanges(fallbackLookback);
+      if (fallbackResult.bullets.length > result.bullets.length) {
+        result = fallbackResult;
+        lookback = fallbackLookback;
+        fallbackUsed = true;
+        console.log(`   ✅ Fallback successful: ${result.bullets.length} items found`);
+      }
+    }
+    
+    // Still sparse? Try team feeds if configured
+    if (result.bullets.length < 2) {
+      console.log(`   🏈 Still sparse, checking team allowlist feeds...`);
+      const teamResult = await this.addTeamFeedRoster(result, lookback);
+      if (teamResult.bullets.length > result.bullets.length) {
+        result = teamResult;
+        console.log(`   ✅ Team feeds added: ${result.bullets.length} total items`);
+      }
+    }
+    
+    return {
+      data: result,
+      fallbackUsed,
+      finalLookback: lookback
+    };
+  }
+
+  /**
+   * Process breaking news with automatic fallback expansion
+   * @param {number} baseLookback - Base lookback hours
+   * @param {string} runType - Run type for fallback calculation
+   * @returns {Promise<Object>} Result with fallback info
+   */
+  async processBreakingWithFallback(baseLookback, runType) {
+    let lookback = baseLookback;
+    let fallbackUsed = false;
+    
+    // Try base lookback first
+    console.log(`   📡 Trying breaking news with ${lookback}h lookback...`);
+    let result = await this.processBreakingNews(lookback);
+    
+    // Apply GPT enhancement if enabled
+    if (process.env.GPT_ENABLED === 'true') {
+      result = await this.enhanceWithGPT(result, 'breaking', lookback);
+    }
+    
+    // If sparse (<2 items), expand lookback
+    if (result.bullets.length < 2) {
+      const fallbackLookback = this.FALLBACK_LOOKBACK[runType] || 48;
+      console.log(`   🔄 Breaking sparse (${result.bullets.length} items), expanding to ${fallbackLookback}h...`);
+      
+      const fallbackResult = await this.processBreakingNews(fallbackLookback);
+      if (fallbackResult.bullets.length > result.bullets.length) {
+        result = fallbackResult;
+        lookback = fallbackLookback;
+        fallbackUsed = true;
+        console.log(`   ✅ Fallback successful: ${result.bullets.length} items found`);
+      }
+    }
+    
+    return {
+      data: result,
+      fallbackUsed,
+      finalLookback: lookback
+    };
+  }
+
+  /**
+   * Process injuries: ESPN table + injury-marked news with lookback filtering
+   * @param {number} lookbackHours - Hours to look back
+   * @returns {Promise<Object>} Formatted injury data
+   */
+  async processInjuries(lookbackHours) {
     const bullets = [];
-    const seenPlayers = new Set(); // Dedupe by player
+    const seenPlayers = new Set();
+    let source = 'None';
 
     try {
-      // Primary: ESPN injuries table
+      // Primary: ESPN injuries table (filter by lookback for non-morning runs)
       console.log('   📋 Fetching ESPN injuries table...');
-      const injuriesData = await espnInjuries.fetchInjuries();
+      let injuriesData = await espnInjuries.fetchInjuries();
       
+      // For afternoon/evening runs, filter by lookback window
+      if (lookbackHours < 24) {
+        const cutoffTime = new Date(Date.now() - (lookbackHours * 60 * 60 * 1000));
+        injuriesData = injuriesData.filter(injury => {
+          // If injury has timestamp, use it; otherwise include all (recent)
+          if (injury.timestamp) {
+            return new Date(injury.timestamp) > cutoffTime;
+          }
+          return true; // Include if no timestamp (recent updates)
+        });
+      }
+      
+      // Format ESPN injuries with new bullet format
       for (const injury of injuriesData) {
         const playerKey = `${injury.player}:${injury.teamAbbr || 'UNK'}`;
         if (!seenPlayers.has(playerKey)) {
@@ -105,138 +282,226 @@ class NewsAggregationService {
         }
       }
 
-      console.log(`   📋 ESPN injuries table: ${bullets.length} bullets`);
+      if (bullets.length > 0) source = 'ESPN table';
+      console.log(`   📋 ESPN injuries: ${bullets.length} bullets from table`);
 
-      // Secondary: Injury news from RSS feeds (allowed sources only)
-      if (bullets.length < cap) {
-        console.log('   📰 Supplementing with injury news...');
-        const injuryNews = await this.fetchInjuryNews(lookbackHours);
+      // Secondary: Injury news from allowed RSS sources
+      const maxInjuries = 20; // Cap at 20 MAX
+      if (bullets.length < maxInjuries) {
+        console.log('   📰 Supplementing with injury news from RSS...');
+        const injuryNews = await this.fetchCategorizedNews(lookbackHours, 'injury');
         
         for (const article of injuryNews) {
-          if (bullets.length >= cap) break;
+          if (bullets.length >= maxInjuries) break;
           
-          const classified = newsClassifier.classify(article);
-          if (classified && classified.category === 'injury') {
-            // Check for player duplication
-            const player = this.extractPlayerFromBullet(classified.factBullet);
-            if (player) {
-              const playerKey = `${player}:UNK`;
-              if (!seenPlayers.has(playerKey)) {
-                bullets.push(classified.factBullet);
-                seenPlayers.add(playerKey);
-              }
-            } else {
-              bullets.push(classified.factBullet);
-            }
+          // Extract factual sentence using site extractors
+          const extracted = await siteExtractors.extractFromUrl(article.url, article.title, 'injury');
+          if (extracted && extracted.sentences && extracted.sentences.length > 0) {
+            const bullet = `${extracted.sentences[0]} (${extracted.sourceShort})`;
+            bullets.push(bullet);
           }
         }
 
-        console.log(`   📰 After news supplement: ${bullets.length} total bullets`);
+        if (injuryNews.length > 0) {
+          source = bullets.length > injuriesData.length ? 'ESPN table + RSS' : 'ESPN table';
+        }
+        console.log(`   📰 After RSS supplement: ${bullets.length} total bullets`);
       }
 
     } catch (error) {
       console.log(`   ❌ Injury processing error: ${error.message}`);
     }
 
-    return bullets;
+    return {
+      bullets: bullets.slice(0, 20), // Cap at 20 MAX
+      totalCount: bullets.length,
+      overflow: Math.max(0, bullets.length - 20),
+      source
+    };
   }
 
   /**
-   * Process roster changes: PFR transactions + team press releases  
-   * @param {number} lookbackHours - Hours to look back
-   * @param {number} cap - Maximum bullets to return
-   * @returns {Promise<Array>} Array of roster bullet strings
+   * Process roster changes: PFR transactions + team press releases with lookback
+   * @param {number} lookbackHours - Hours to look back  
+   * @returns {Promise<Object>} Formatted roster data
    */
-  async processRosterChanges(lookbackHours, cap) {
+  async processRosterChanges(lookbackHours) {
     const bullets = [];
-    const seenUrls = new Set(); // Dedupe by URL
+    const seenUrls = new Set();
+    let source = 'None';
 
     try {
-      // Primary: ProFootballRumors transactions
+      // Primary: ProFootballRumors transactions with enhanced sentences
       console.log('   📄 Fetching PFR transactions...');
       const pfrTrans = await pfrTransactions.fetchTransactions(lookbackHours);
       
       for (const transaction of pfrTrans) {
-        if (bullets.length >= cap) break;
-        
         if (!seenUrls.has(transaction.url)) {
           bullets.push(transaction.bullet);
           seenUrls.add(transaction.url);
         }
       }
 
+      if (bullets.length > 0) source = 'PFR';
       console.log(`   📄 PFR transactions: ${bullets.length} bullets`);
 
-      // Secondary: Team press releases (if configured)
-      // TODO: Add team RSS feeds when more team feeds are configured
-      if (bullets.length < cap) {
-        console.log('   🏈 Team press releases: not implemented yet');
-        // This would fetch from teamMappings.teamRSSFeeds
+      // Secondary: NFL.com roster items with roster patterns
+      const maxRoster = 12; // Cap at 12
+      if (bullets.length < maxRoster) {
+        console.log('   🏈 Supplementing with NFL.com roster news...');
+        const rosterNews = await this.fetchCategorizedNews(lookbackHours, 'roster');
+        
+        for (const article of rosterNews) {
+          if (bullets.length >= maxRoster) break;
+          
+          // Only include NFL.com for roster supplement
+          if (article.url.includes('nfl.com')) {
+            const extracted = await siteExtractors.extractFromUrl(article.url, article.title, 'roster');
+            if (extracted && extracted.sentences && extracted.sentences.length > 0) {
+              const bullet = `${extracted.sentences[0]} (${extracted.sourceShort})`;
+              bullets.push(bullet);
+              seenUrls.add(article.url);
+            }
+          }
+        }
+
+        if (bullets.length > pfrTrans.length) {
+          source = 'PFR + NFL.com';
+        }
+        console.log(`   🏈 After NFL.com supplement: ${bullets.length} total bullets`);
       }
 
     } catch (error) {
       console.log(`   ❌ Roster processing error: ${error.message}`);
     }
 
-    return bullets;
+    return {
+      bullets: bullets.slice(0, 12), // Cap at 12
+      totalCount: bullets.length,
+      overflow: Math.max(0, bullets.length - 12),
+      source
+    };
   }
 
   /**
    * Process breaking news: major announcements not in injury/roster
    * @param {number} lookbackHours - Hours to look back
-   * @param {number} cap - Maximum bullets to return
-   * @returns {Promise<Array>} Array of breaking news bullet strings
+   * @returns {Promise<Object>} Formatted breaking data
    */
-  async processBreakingNews(lookbackHours, cap) {
+  async processBreakingNews(lookbackHours) {
     const bullets = [];
+    const seenUrls = new Set();
+    let source = 'None';
     
     try {
-      // Get general RSS articles
-      console.log('   📡 Fetching general news articles...');
-      const articles = await rssFullText.fetchFeeds(lookbackHours);
+      console.log('   📡 Fetching breaking news articles...');
+      const articles = await this.fetchCategorizedNews(lookbackHours, 'breaking');
       
+      const maxBreaking = 10; // Cap at 10
       for (const article of articles) {
-        if (bullets.length >= cap) break;
+        if (bullets.length >= maxBreaking) break;
         
-        const classified = newsClassifier.classify(article);
-        if (classified && classified.category === 'breaking') {
-          bullets.push(classified.factBullet);
+        if (!seenUrls.has(article.url)) {
+          const extracted = await siteExtractors.extractFromUrl(article.url, article.title, 'breaking');
+          if (extracted && extracted.sentences && extracted.sentences.length > 0) {
+            const bullet = `${extracted.sentences[0]} (${extracted.sourceShort})`;
+            bullets.push(bullet);
+            seenUrls.add(article.url);
+          }
         }
       }
 
+      if (bullets.length > 0) source = 'RSS';
       console.log(`   📡 Breaking news: ${bullets.length} bullets`);
 
     } catch (error) {
       console.log(`   ❌ Breaking news processing error: ${error.message}`);
     }
 
-    return bullets;
+    return {
+      bullets: bullets.slice(0, 10), // Cap at 10
+      totalCount: bullets.length,
+      overflow: Math.max(0, bullets.length - 10),
+      source
+    };
   }
 
   /**
-   * Fetch injury-specific news from allowed RSS sources
+   * Fetch categorized news from RSS feeds
    * @param {number} lookbackHours - Hours to look back
+   * @param {string} category - Category to fetch (injury/roster/breaking)
    * @returns {Promise<Array>} Array of articles
    */
-  async fetchInjuryNews(lookbackHours) {
+  async fetchCategorizedNews(lookbackHours, category) {
     try {
       const allArticles = await rssFullText.fetchFeeds(lookbackHours);
       
-      // Filter to injury-allowed sources only
-      const injurySources = ['espn.com', 'nfl.com', 'yahoo.com', 'profootballtalk.nbcsports.com'];
-      
-      return allArticles.filter(article => {
+      // Filter to category-allowed sources
+      const allowedSources = this.CATEGORY_SOURCES[category] || [];
+      const filteredArticles = allArticles.filter(article => {
         const domain = this.getSourceDomain(article.url || article.feedUrl);
-        return injurySources.some(allowed => domain.includes(allowed));
+        return allowedSources.some(allowed => domain.includes(allowed));
       });
+      
+      // Classify articles using newsClassifier
+      const categorized = [];
+      for (const article of filteredArticles) {
+        const classified = newsClassifier.classify(article);
+        if (classified && classified.category === category) {
+          categorized.push(article);
+        }
+      }
+      
+      return categorized;
     } catch (error) {
-      console.log(`   ❌ Injury news fetch failed: ${error.message}`);
+      console.log(`   ❌ ${category} news fetch failed: ${error.message}`);
       return [];
     }
   }
 
   /**
-   * Format ESPN injury table entry as bullet
+   * Add team allowlist feeds for injuries (if configured)
+   * @param {Object} currentResult - Current injury result
+   * @param {number} lookbackHours - Hours to look back
+   * @returns {Promise<Object>} Enhanced result
+   */
+  async addTeamFeedInjuries(currentResult, lookbackHours) {
+    // Check if TEAM_FEEDS environment variable is configured
+    const teamFeeds = process.env.TEAM_FEEDS;
+    if (!teamFeeds) {
+      console.log('   ⚠️ TEAM_FEEDS not configured, skipping team feeds');
+      return currentResult;
+    }
+    
+    console.log('   🏈 Team feeds configured, fetching team injury news...');
+    // TODO: Implement team RSS feed processing when configured
+    // This would parse the comma-separated TEAM_FEEDS URLs and extract injury news
+    
+    return currentResult; // For now, return unchanged
+  }
+
+  /**
+   * Add team allowlist feeds for roster (if configured)
+   * @param {Object} currentResult - Current roster result
+   * @param {number} lookbackHours - Hours to look back
+   * @returns {Promise<Object>} Enhanced result
+   */
+  async addTeamFeedRoster(currentResult, lookbackHours) {
+    // Check if TEAM_FEEDS environment variable is configured
+    const teamFeeds = process.env.TEAM_FEEDS;
+    if (!teamFeeds) {
+      console.log('   ⚠️ TEAM_FEEDS not configured, skipping team feeds');
+      return currentResult;
+    }
+    
+    console.log('   🏈 Team feeds configured, fetching team roster news...');
+    // TODO: Implement team RSS feed processing when configured
+    
+    return currentResult; // For now, return unchanged
+  }
+
+  /**
+   * Format ESPN injury table entry using enhanced format
    * @param {Object} injury - ESPN injury object
    * @returns {string|null} Formatted bullet or null
    */
@@ -245,76 +510,31 @@ class NewsAggregationService {
     
     let bullet = '';
     
+    // Build base: Player (TEAM) — Status
     if (injury.teamAbbr) {
       bullet = `${injury.player} (${injury.teamAbbr}) — ${injury.status}`;
     } else {
       bullet = `${injury.player} — ${injury.status}`;
     }
     
-    // Add note if present and valuable
-    if (injury.note && injury.note.length > 3) {
-      bullet += `; ${injury.note}`;
+    // Add injury note in parentheses if present
+    if (injury.injuryNote && injury.injuryNote.length > 0) {
+      bullet += ` (${injury.injuryNote})`;
     }
+    
+    // Add updated date with bullet separator
+    bullet += ` · Updated ${injury.updatedDate || 'Recently'}`;
     
     // Add source
     bullet += ` (${injury.source})`;
     
-    // Format properly (320 char soft limit)
-    return this.formatBullet(bullet);
-  }
-
-  /**
-   * Extract player name from bullet (simple heuristic)
-   * @param {string} bullet - Bullet text
-   * @returns {string|null} Player name or null
-   */
-  extractPlayerFromBullet(bullet) {
-    if (!bullet) return null;
-    
-    // Look for "Name (TEAM)" or "Name —" patterns
-    const patterns = [
-      /^([A-Z][a-z]+'?\s+[A-Z][a-z]+)\s+\(/,  // "John Smith ("
-      /^([A-Z][a-z]+'?\s+[A-Z][a-z]+)\s+—/    // "John Smith —"
-    ];
-    
-    for (const pattern of patterns) {
-      const match = bullet.match(pattern);
-      if (match) return match[1];
+    // Format properly with 320 char soft limit
+    if (bullet.length > 320) {
+      const truncated = bullet.substring(0, 317) + '...';
+      bullet = truncated;
     }
     
-    return null;
-  }
-
-  /**
-   * Format bullet with proper length and punctuation
-   * @param {string} bullet - Raw bullet
-   * @returns {string} Formatted bullet
-   */
-  formatBullet(bullet) {
-    if (!bullet) return '';
-    
-    let formatted = bullet.trim();
-    
-    // Ensure proper capitalization
-    formatted = formatted.charAt(0).toUpperCase() + formatted.slice(1);
-    
-    // Soft limit 320 chars, truncate at word boundary
-    if (formatted.length > 320) {
-      const truncated = formatted.substring(0, 317);
-      const lastSpace = truncated.lastIndexOf(' ');
-      formatted = (lastSpace > 250 ? truncated.substring(0, lastSpace) : truncated) + '...';
-    }
-    
-    // Ensure proper ending
-    if (!formatted.match(/[.!?)\]]$/)) {
-      if (formatted.match(/\([A-Z]+\)$/)) {
-        // Ends with source citation
-      } else {
-        formatted += '.';
-      }
-    }
-    
-    return formatted;
+    return bullet;
   }
 
   /**
@@ -339,10 +559,203 @@ class NewsAggregationService {
    */
   getEmptyResult() {
     return {
-      injuries: { bullets: [], totalCount: 0, overflow: 0 },
-      roster: { bullets: [], totalCount: 0, overflow: 0 },
-      breaking: { bullets: [], totalCount: 0, overflow: 0 }
+      injuries: { bullets: [], totalCount: 0, overflow: 0, source: 'None' },
+      roster: { bullets: [], totalCount: 0, overflow: 0, source: 'None' },
+      breaking: { bullets: [], totalCount: 0, overflow: 0, source: 'None' },
+      fallbacksUsed: []
     };
+  }
+
+  /**
+   * Enhance category results with GPT summarization - improved logic
+   * @param {Object} result - Current category result with bullets
+   * @param {string} category - Category type (injuries/roster/breaking)
+   * @param {number} lookbackHours - Hours looked back
+   * @returns {Promise<Object>} Enhanced result
+   */
+  async enhanceWithGPT(result, category, lookbackHours) {
+    try {
+      console.log(`   🤖 Enhancing ${category} with GPT...`);
+      
+      // Policy: Only enhance sparse sections (< 2 bullets) to save GPT calls
+      if (result.bullets.length >= 2) {
+        console.log(`   ℹ️ ${category} has ${result.bullets.length} bullets, skipping GPT (not sparse)`);
+        return result;
+      }
+      
+      // Prepare excerpts for GPT
+      const excerpts = await this.prepareArticlesForGPT(category, lookbackHours);
+      
+      if (excerpts.length === 0) {
+        console.log(`   ⚠️ No excerpts available for GPT enhancement`);
+        return result;
+      }
+      
+      const dateISO = new Date().toISOString().split('T')[0];
+      let gptBullets = [];
+      
+      // Call appropriate GPT function based on category
+      switch(category) {
+        case 'injuries':
+          gptBullets = await gptSummarizer.summarizeInjuries(excerpts, dateISO);
+          break;
+        case 'roster':
+          gptBullets = await gptSummarizer.summarizeRoster(excerpts, dateISO);
+          break;
+        case 'breaking':
+          gptBullets = await gptSummarizer.summarizeBreaking(excerpts, dateISO);
+          break;
+      }
+      
+      if (gptBullets.length > 0) {
+        console.log(`   ✅ GPT produced ${gptBullets.length} enhanced bullets`);
+        
+        // Merge GPT bullets with existing ones (GPT bullets first)
+        const mergedBullets = [...gptBullets, ...result.bullets];
+        
+        // Apply semantic deduplication
+        const dedupedBullets = await gptSummarizer.semanticDedupe(mergedBullets);
+        
+        // Update result
+        const maxBullets = category === 'injuries' ? 20 : (category === 'roster' ? 12 : 10);
+        result.bullets = dedupedBullets.slice(0, maxBullets);
+        result.totalCount = dedupedBullets.length;
+        result.overflow = Math.max(0, dedupedBullets.length - maxBullets);
+        result.source = result.source === 'None' ? 'GPT' : `${result.source} + GPT`;
+        
+        console.log(`   ✅ After GPT enhancement: ${result.bullets.length} final bullets`);
+      } else {
+        console.log(`   ⚠️ GPT produced no bullets, keeping rule-based results`);
+      }
+      
+    } catch (error) {
+      console.log(`   ❌ GPT enhancement failed: ${error.message}, keeping rule-based results`);
+    }
+    
+    return result;
+  }
+
+  /**
+   * Prepare articles for GPT processing - enhanced with better excerpt formatting
+   * @param {string} category - Category type
+   * @param {number} lookbackHours - Hours to look back
+   * @returns {Promise<Array>} Articles formatted as Excerpts for GPT
+   */
+  async prepareArticlesForGPT(category, lookbackHours) {
+    try {
+      // Fetch categorized articles
+      const articles = await this.fetchCategorizedNews(lookbackHours, category);
+      
+      // Format as Excerpt objects (500-700 chars per text)
+      const excerpts = articles.slice(0, 5).map(article => ({
+        source: this.deriveSourceShort(article.url || article.feedUrl),
+        url: article.url,
+        title: article.title ? article.title.substring(0, 100) : undefined,
+        text: this.cleanTextForGPT(article.content || article.description || ''),
+        team: this.extractTeamFromArticle(article),
+        player: this.extractPlayerFromArticle(article)
+      })).filter(excerpt => excerpt.text.length > 50); // Must have meaningful text
+      
+      return excerpts;
+      
+    } catch (error) {
+      console.log(`   ❌ Failed to prepare excerpts for GPT: ${error.message}`);
+      return [];
+    }
+  }
+
+  /**
+   * Clean text for GPT processing - remove bylines, ads, URLs
+   * @param {string} text - Raw text content
+   * @returns {string} Cleaned text (500-700 chars target)
+   */
+  cleanTextForGPT(text) {
+    if (!text) return '';
+    
+    // Remove bylines and author info
+    text = text.replace(/^(By\s+[^\n]+|Staff\s+Report|Associated\s+Press|Reuters)[\n\r]*/i, '');
+    
+    // Remove URLs and social media handles
+    text = text.replace(/https?:\/\/\S+/g, '').replace(/@\w+|#\w+/g, '');
+    
+    // Remove advertisement patterns
+    text = text.replace(/(Advertisement|ADVERTISEMENT)[\s\S]*?(?=\n\n|$)/gi, '');
+    
+    // Clean whitespace
+    text = text.replace(/\s+/g, ' ').trim();
+    
+    // Trim to 500-700 chars at sentence boundary if possible
+    if (text.length > 700) {
+      const sentences = text.split(/(?<=[.!?])\s+/);
+      let result = '';
+      for (const sentence of sentences) {
+        if ((result + sentence).length <= 700) {
+          result += (result ? ' ' : '') + sentence;
+        } else {
+          break;
+        }
+      }
+      text = result || text.substring(0, 697) + '...';
+    }
+    
+    return text;
+  }
+
+  /**
+   * Extract team name from article content
+   * @param {Object} article - Article object
+   * @returns {string|undefined} Team name if found
+   */
+  extractTeamFromArticle(article) {
+    const text = (article.title + ' ' + article.content).toLowerCase();
+    const teamKeywords = [
+      'cowboys', 'patriots', 'steelers', 'packers', 'chiefs', 'bills',
+      'dolphins', 'jets', 'ravens', 'bengals', 'browns', 'texans',
+      'colts', 'jaguars', 'titans', 'broncos', 'chargers', 'raiders',
+      'eagles', 'giants', 'washington', 'bears', 'lions', 'packers',
+      'vikings', 'falcons', 'panthers', 'saints', 'bucs', 'cardinals',
+      '49ers', 'seahawks', 'rams'
+    ];
+    
+    for (const team of teamKeywords) {
+      if (text.includes(team)) {
+        return team;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Extract player name from article content
+   * @param {Object} article - Article object
+   * @returns {string|undefined} Player name if found
+   */
+  extractPlayerFromArticle(article) {
+    // Simple heuristic: look for capitalized names in title
+    const title = article.title || '';
+    const nameMatch = title.match(/\b[A-Z][a-z]+\s+[A-Z][a-z]+\b/);
+    return nameMatch ? nameMatch[0] : undefined;
+  }
+
+  /**
+   * Derive short source name from URL
+   * @param {string} url - URL
+   * @returns {string} Short source name
+   */
+  deriveSourceShort(url) {
+    if (!url) return 'Unknown';
+    
+    const domain = this.getSourceDomain(url);
+    const sourceMap = {
+      'espn.com': 'ESPN',
+      'nfl.com': 'NFL.com',
+      'profootballtalk.nbcsports.com': 'PFT',
+      'yahoo.com': 'Yahoo',
+      'cbssports.com': 'CBS',
+      'profootballrumors.com': 'PFR'
+    };
+    
+    return sourceMap[domain] || domain.split('.')[0].toUpperCase();
   }
 
   /**
@@ -350,14 +763,19 @@ class NewsAggregationService {
    * @returns {Object} Status information
    */
   getStatus() {
+    const gptStatus = gptSummarizer.getStatus();
+    
     return {
       cacheKeyPrefix: this.cacheKeyPrefix,
-      sourceRouting: 'strict',
-      categories: {
-        injuries: 'ESPN table + injury news',
-        roster: 'PFR transactions + team releases',
-        breaking: 'remaining classified items'
-      }
+      defaultLookback: this.DEFAULT_LOOKBACK,
+      fallbackLookback: this.FALLBACK_LOOKBACK,
+      categorySources: this.CATEGORY_SOURCES,
+      widened: true,
+      fallbacksEnabled: true,
+      gptEnabled: gptStatus.enabled,
+      gptModel: gptStatus.model,
+      gptCallsUsed: gptStatus.callsUsed,
+      gptCallsLimit: gptStatus.callsLimit
     };
   }
 }

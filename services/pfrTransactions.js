@@ -233,21 +233,32 @@ class PFRTransactionsService {
    * @returns {Object|null} Transaction object or null
    */
   buildTransaction(item, titleInfo, fullText, canonicalUrl) {
-    // Determine the roster action and build bullet
-    const actionPhrase = this.extractActionPhrase(titleInfo.rawTitle, fullText);
-    if (!actionPhrase) return null;
+    // Extract full report sentence instead of just action phrase
+    const reportSentence = this.extractReportSentence(titleInfo.rawTitle, fullText);
+    if (!reportSentence) return null;
     
-    const team = titleInfo.team || this.extractTeamFromText(fullText);
-    const player = titleInfo.player || this.extractPlayerFromText(fullText);
+    const team = titleInfo.team || this.extractTeamFromText(reportSentence);
+    const player = titleInfo.player || this.extractPlayerFromText(reportSentence);
     
-    // Build the bullet in format: "TEAM — action PLAYER (details) (PFR)"
+    // Build the bullet with full sentence: "TEAM — <full sentence> (PFR)"
     let bullet = '';
-    if (team && actionPhrase) {
-      bullet = `${team} — ${actionPhrase}`;
-    } else if (actionPhrase) {
-      bullet = actionPhrase;
+    if (team && reportSentence) {
+      // Ensure team is uppercase
+      const teamUpper = team.toUpperCase();
+      const cleanSentence = this.cleanSentenceForBullet(reportSentence, player);
+      bullet = `${teamUpper} — ${cleanSentence}`;
+    } else if (reportSentence) {
+      bullet = this.cleanSentenceForBullet(reportSentence, player);
     } else {
       return null;
+    }
+    
+    // Check if there's a meaningful second sentence with contract details
+    if (fullText) {
+      const secondSentence = this.extractSecondSentenceWithDetails(fullText, reportSentence);
+      if (secondSentence && (bullet.length + secondSentence.length + 3) <= 320) {
+        bullet += `; ${secondSentence}`;
+      }
     }
     
     // Add PFR source
@@ -264,7 +275,7 @@ class PFRTransactionsService {
       date: item.isoDate || item.pubDate,
       team,
       player,
-      actionPhrase,
+      reportSentence,
       bullet,
       source: 'PFR',
       category: 'roster'
@@ -375,6 +386,20 @@ class PFRTransactionsService {
   }
 
   /**
+   * Convert text to sentence case (first letter uppercase, rest lowercase)
+   * @param {string} text - Text to convert
+   * @returns {string} Sentence case text
+   */
+  toSentenceCase(text) {
+    if (!text) return '';
+    
+    const trimmed = text.trim();
+    if (trimmed.length === 0) return '';
+    
+    return trimmed.charAt(0).toUpperCase() + trimmed.slice(1).toLowerCase();
+  }
+
+  /**
    * Format bullet with proper length and punctuation
    * @param {string} bullet - Raw bullet
    * @returns {string} Formatted bullet
@@ -452,6 +477,134 @@ class PFRTransactionsService {
         roster: this.ROSTER_PATTERNS.toString()
       }
     };
+  }
+
+  /**
+   * Extract full report sentence from title/text (enhanced for full sentences)
+   * @param {string} title - Article title
+   * @param {string} fullText - Full article text
+   * @returns {string|null} Complete report sentence or null
+   */
+  extractReportSentence(title, fullText) {
+    // Try to find complete sentence in title first
+    const titleSentence = this.findCompleteSentence(title);
+    if (titleSentence) return titleSentence;
+    
+    // Try first few sentences of article for complete transactions
+    if (fullText) {
+      const sentences = this.splitSentences(fullText).slice(0, 5);
+      for (const sentence of sentences) {
+        if (this.ROSTER_PATTERNS.test(sentence.toLowerCase()) && 
+            sentence.length > 15 && sentence.length <= 280) {
+          return this.cleanSentenceForBullet(sentence);
+        }
+      }
+    }
+    
+    return null;
+  }
+
+  /**
+   * Find complete sentence with roster action
+   * @param {string} text - Text to search
+   * @returns {string|null} Complete sentence or null
+   */
+  findCompleteSentence(text) {
+    if (!text || !this.ROSTER_PATTERNS.test(text.toLowerCase())) return null;
+    
+    // If the whole text is already a sentence-like structure, use it
+    if (text.length <= 280 && text.length > 15) {
+      return text;
+    }
+    
+    return null;
+  }
+
+  /**
+   * Split text into proper sentences
+   * @param {string} text - Text to split
+   * @returns {Array} Array of sentences
+   */
+  splitSentences(text) {
+    if (!text) return [];
+    
+    // Handle abbreviations
+    const abbreviations = ['Jr.', 'Sr.', 'Dr.', 'Mr.', 'Mrs.', 'Ms.', 'U.S.', 'N.F.L.'];
+    let processedText = text;
+    const placeholders = {};
+    
+    abbreviations.forEach((abbr, index) => {
+      const placeholder = `__ABBR${index}__`;
+      if (processedText.includes(abbr)) {
+        placeholders[placeholder] = abbr;
+        processedText = processedText.replace(new RegExp(abbr.replace('.', '\\.'), 'g'), placeholder);
+      }
+    });
+    
+    // Split on sentence boundaries
+    const sentences = processedText
+      .split(/[.!?]+\s+(?=[A-Z])/)
+      .map(sentence => {
+        let restored = sentence.trim();
+        Object.entries(placeholders).forEach(([placeholder, original]) => {
+          restored = restored.replace(new RegExp(placeholder, 'g'), original);
+        });
+        return restored;
+      })
+      .filter(s => s.length > 10);
+    
+    return sentences;
+  }
+
+  /**
+   * Clean sentence for bullet formatting
+   * @param {string} sentence - Raw sentence
+   * @param {string} player - Player name to avoid repetition
+   * @returns {string} Cleaned sentence
+   */
+  cleanSentenceForBullet(sentence, player = null) {
+    if (!sentence) return '';
+    
+    let cleaned = sentence
+      // Remove bylines
+      .replace(/^By [A-Za-z\s]+,?\s*/i, '')
+      // Remove common prefixes
+      .replace(/^(The\s+)?[A-Z\s]+ (announced|confirmed|reported)\s+/i, '')
+      // Clean whitespace
+      .replace(/\s+/g, ' ')
+      .trim();
+    
+    // Ensure proper sentence case
+    if (cleaned.length > 0) {
+      cleaned = cleaned.charAt(0).toUpperCase() + cleaned.slice(1).toLowerCase();
+    }
+    
+    return cleaned;
+  }
+
+  /**
+   * Extract second sentence with contract/IR details
+   * @param {string} fullText - Full article text
+   * @param {string} firstSentence - First sentence already extracted
+   * @returns {string|null} Second sentence with details or null
+   */
+  extractSecondSentenceWithDetails(fullText, firstSentence) {
+    if (!fullText) return null;
+    
+    const sentences = this.splitSentences(fullText);
+    const firstIndex = sentences.findIndex(s => s.includes(firstSentence.substring(0, 20)));
+    
+    if (firstIndex >= 0 && firstIndex < sentences.length - 1) {
+      const secondSentence = sentences[firstIndex + 1];
+      
+      // Check if second sentence contains meaningful contract/IR terms
+      const meaningfulTerms = /\b(contract|terms|year|million|practice squad|ir|extension|guaranteed|deal|agreement)\b/i;
+      if (meaningfulTerms.test(secondSentence) && secondSentence.length <= 150) {
+        return this.cleanSentenceForBullet(secondSentence);
+      }
+    }
+    
+    return null;
   }
 }
 

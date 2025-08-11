@@ -35,13 +35,17 @@ class ESPNInjuriesService {
       
       const injuries = this.parseInjuriesTable(document);
       
-      // Filter for new/changed injuries since last run
-      const newOrChangedInjuries = this.filterNewOrChanged(injuries);
+      // Sort by updated date descending (most recent first)
+      const sortedInjuries = this.sortInjuriesByDate(injuries);
       
-      console.log(`✅ ESPN injuries: ${injuries.length} total, ${newOrChangedInjuries.length} new/changed`);
+      // Deduplicate by player+status+note combination
+      const uniqueInjuries = this.deduplicateInjuries(sortedInjuries);
+      
+      console.log(`✅ ESPN injuries: ${injuries.length} total → ${sortedInjuries.length} sorted → ${uniqueInjuries.length} unique`);
       
       this.lastFetchTime = new Date();
-      return newOrChangedInjuries.slice(0, 8); // Cap to 8 newest
+      // Cap to 20 MAX (no "+N more" text)
+      return uniqueInjuries.slice(0, 20);
       
     } catch (error) {
       console.log(`❌ ESPN injuries fetch failed: ${error.message}`);
@@ -102,11 +106,12 @@ class ESPNInjuriesService {
     const cells = row.querySelectorAll('td');
     if (cells.length < 3) return null;
 
-    // ESPN table structure: [Player, Position, Status, Comment]
+    // ESPN table structure: [Player, Position, Status, Comment, Date] (Date may be in last column)
     let player = null;
     let team = null;
     let status = null;
-    let note = null;
+    let injuryNote = null;
+    let updatedDate = null;
 
     // Extract player name (usually in first cell)
     const playerCell = cells[0];
@@ -121,28 +126,48 @@ class ESPNInjuriesService {
     const teamAbbr = this.extractTeamFromCell(playerCell) || 
                      this.extractTeamFromCell(cells[1]);
 
-    if (teamAbbr) {
-      team = teamMappings.getTeamFullName(teamAbbr) || teamAbbr;
-    }
-
-    // Status is usually in the 3rd or 4th cell
+    // Status is usually in the 3rd cell (after Player, Position)
     if (cells.length >= 3) {
       status = cells[2].textContent?.trim();
     }
 
-    // Note/comment is usually in the last cell
+    // Note/comment is usually in the 4th cell
     if (cells.length >= 4) {
-      note = cells[3].textContent?.trim();
+      injuryNote = cells[3].textContent?.trim();
     }
 
-    if (!player || !status) return null;
+    // Updated date might be in the last cell (5th or later)
+    if (cells.length >= 5) {
+      const dateCell = cells[cells.length - 1];
+      const dateText = dateCell.textContent?.trim();
+      if (dateText && this.isDateLike(dateText)) {
+        updatedDate = this.parseUpdatedDate(dateText);
+      }
+    } else if (cells.length >= 4) {
+      // Sometimes date might be in the 4th cell instead of injury note
+      const possibleDate = cells[3].textContent?.trim();
+      if (possibleDate && this.isDateLike(possibleDate)) {
+        updatedDate = this.parseUpdatedDate(possibleDate);
+        injuryNote = null; // No separate injury note
+      }
+    }
+
+    // Validate we have essential data
+    if (!player) return null;
+    if (!status && !injuryNote) return null;
+
+    // Use "Status not specified" if status missing but note exists
+    if (!status && injuryNote) {
+      status = 'Status not specified';
+    }
 
     return {
       player: this.cleanPlayerName(player),
-      team: team,
+      team: teamMappings.getTeamFullName(teamAbbr) || teamAbbr,
       teamAbbr: teamAbbr,
       status: this.cleanStatus(status),
-      note: this.cleanNote(note),
+      injuryNote: this.cleanNote(injuryNote),
+      updatedDate: updatedDate || 'Recently', // Fallback if no date found
       source: 'ESPN',
       timestamp: new Date()
     };
@@ -220,24 +245,46 @@ class ESPNInjuriesService {
   }
 
   /**
-   * Filter for new or changed injuries since last run
-   * @param {Array} injuries - Current injuries
-   * @returns {Array} New or changed injuries
+   * Sort injuries by updated date descending (most recent first)
+   * @param {Array} injuries - Array of injury objects
+   * @returns {Array} Sorted injuries
    */
-  filterNewOrChanged(injuries) {
-    const newOrChanged = [];
-
-    for (const injury of injuries) {
-      const key = `${injury.player}:${injury.teamAbbr || 'UNK'}`;
-      const lastStatus = this.lastInjuries.get(key);
+  sortInjuriesByDate(injuries) {
+    return injuries.sort((a, b) => {
+      // Handle 'Recently' as most recent
+      if (a.updatedDate === 'Recently' && b.updatedDate !== 'Recently') return -1;
+      if (b.updatedDate === 'Recently' && a.updatedDate !== 'Recently') return 1;
+      if (a.updatedDate === 'Recently' && b.updatedDate === 'Recently') return 0;
       
-      if (!lastStatus || lastStatus !== injury.status) {
-        newOrChanged.push(injury);
-        this.lastInjuries.set(key, injury.status);
+      // Convert dates for comparison (simple string comparison works for "Mon DD" format)
+      const dateA = a.updatedDate || 'Jan 1';
+      const dateB = b.updatedDate || 'Jan 1';
+      
+      // For same month-day format, newer entries are likely more recent
+      // This is a simplified approach - for exact sorting we'd need year info
+      return dateB.localeCompare(dateA);
+    });
+  }
+
+  /**
+   * Deduplicate injuries by player+status+note combination
+   * @param {Array} injuries - Array of injury objects
+   * @returns {Array} Unique injuries
+   */
+  deduplicateInjuries(injuries) {
+    const seen = new Set();
+    const unique = [];
+    
+    for (const injury of injuries) {
+      const key = `${injury.player}:${injury.teamAbbr || 'UNK'}:${injury.status}:${injury.injuryNote || 'none'}`;
+      
+      if (!seen.has(key)) {
+        seen.add(key);
+        unique.push(injury);
       }
     }
-
-    return newOrChanged;
+    
+    return unique;
   }
 
   /**
@@ -289,26 +336,80 @@ class ESPNInjuriesService {
   }
 
   /**
-   * Format injuries as bullet points
+   * Check if text looks like a date
+   * @param {string} text - Text to check
+   * @returns {boolean} True if looks like a date
+   */
+  isDateLike(text) {
+    if (!text) return false;
+    
+    // Common ESPN date patterns: "Aug 16", "Feb 9", "12/25", etc.
+    const datePatterns = [
+      /^[A-Za-z]{3}\s+\d{1,2}$/,  // "Aug 16"
+      /^\d{1,2}\/\d{1,2}$/,       // "8/16" 
+      /^\d{1,2}-\d{1,2}$/,        // "8-16"
+      /^[A-Za-z]{3}\s+\d{1,2},?\s+\d{4}$/  // "Aug 16, 2025"
+    ];
+    
+    return datePatterns.some(pattern => pattern.test(text.trim()));
+  }
+
+  /**
+   * Parse updated date from ESPN format
+   * @param {string} dateText - Raw date text
+   * @returns {string} Formatted date
+   */
+  parseUpdatedDate(dateText) {
+    if (!dateText) return 'Recently';
+    
+    const cleaned = dateText.trim();
+    
+    // Handle different ESPN date formats
+    if (/^[A-Za-z]{3}\s+\d{1,2}$/.test(cleaned)) {
+      // "Aug 16" format - most common
+      return cleaned;
+    } else if (/^\d{1,2}\/\d{1,2}$/.test(cleaned)) {
+      // "8/16" format - convert to month name
+      const [month, day] = cleaned.split('/');
+      const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                         'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      const monthName = monthNames[parseInt(month) - 1];
+      return monthName ? `${monthName} ${day}` : cleaned;
+    } else if (/^[A-Za-z]{3}\s+\d{1,2},?\s+\d{4}$/.test(cleaned)) {
+      // "Aug 16, 2025" format - extract month and day
+      const match = cleaned.match(/^([A-Za-z]{3})\s+(\d{1,2})/);
+      return match ? `${match[1]} ${match[2]}` : cleaned;
+    }
+    
+    return cleaned;
+  }
+
+  /**
+   * Format injuries as bullet points using new format
    * @param {Array} injuries - Array of injury objects
    * @returns {Array} Array of formatted bullet strings
    */
   formatBullets(injuries) {
     return injuries.map(injury => {
+      // New format: "Player (TEAM) — Status (injuryNote) · Updated Mon DD (ESPN)"
+      if (!injury.player) return null;
+      
       let bullet = '';
       
-      if (injury.player && injury.teamAbbr) {
+      // Build base: Player (TEAM) — Status
+      if (injury.teamAbbr) {
         bullet = `${injury.player} (${injury.teamAbbr}) — ${injury.status}`;
-      } else if (injury.player) {
-        bullet = `${injury.player} — ${injury.status}`;
       } else {
-        return null;
+        bullet = `${injury.player} — ${injury.status}`;
       }
       
-      // Add note if present and adds value
-      if (injury.note && injury.note.length > 3) {
-        bullet += `; ${injury.note}`;
+      // Add injury note in parentheses if present
+      if (injury.injuryNote && injury.injuryNote.length > 0) {
+        bullet += ` (${injury.injuryNote})`;
       }
+      
+      // Add updated date with bullet separator
+      bullet += ` · Updated ${injury.updatedDate}`;
       
       // Add source attribution
       bullet += ` (${injury.source})`;

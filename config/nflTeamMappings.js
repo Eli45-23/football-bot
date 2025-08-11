@@ -73,6 +73,42 @@ const teamRSSFeeds = {
   // Add more as needed
 };
 
+// TheSportsDB team ID mappings for NFL teams
+const sportsDbTeamIds = {
+  'Arizona Cardinals': '134934',
+  'Atlanta Falcons': '134942',
+  'Baltimore Ravens': '134936',
+  'Buffalo Bills': '134935',
+  'Carolina Panthers': '134937',
+  'Chicago Bears': '134938',
+  'Cincinnati Bengals': '134940',
+  'Cleveland Browns': '134941',
+  'Dallas Cowboys': '134945',
+  'Denver Broncos': '134946',
+  'Detroit Lions': '134939',
+  'Green Bay Packers': '134943',
+  'Houston Texans': '134948',
+  'Indianapolis Colts': '134947',
+  'Jacksonville Jaguars': '134949',
+  'Kansas City Chiefs': '134951',
+  'Las Vegas Raiders': '134950',
+  'Los Angeles Chargers': '135908',
+  'Los Angeles Rams': '134951',
+  'Miami Dolphins': '134919',
+  'Minnesota Vikings': '134952',
+  'New England Patriots': '134953',
+  'New Orleans Saints': '134954',
+  'New York Giants': '134955',
+  'New York Jets': '134956',
+  'Philadelphia Eagles': '134958',
+  'Pittsburgh Steelers': '134957',
+  'San Francisco 49ers': '134959',
+  'Seattle Seahawks': '134960',
+  'Tampa Bay Buccaneers': '134961',
+  'Tennessee Titans': '134929',
+  'Washington Commanders': '134962'
+};
+
 // Allowed domains for official team news
 const officialTeamDomains = [
   'patriots.com',
@@ -111,6 +147,7 @@ module.exports = {
   reverseMapping,
   teamRSSFeeds,
   officialTeamDomains,
+  sportsDbTeamIds,
   
   /**
    * Get team abbreviation from full name or partial match
@@ -149,6 +186,28 @@ module.exports = {
    */
   getTeamFullName(abbr) {
     return teamMappings[abbr?.toUpperCase()] || null;
+  },
+  
+  /**
+   * Get TheSportsDB team ID from team name
+   * @param {string} teamName - Full team name
+   * @returns {string|null} TheSportsDB team ID or null
+   */
+  getTeamId(teamName) {
+    if (!teamName) return null;
+    
+    // Direct lookup
+    if (sportsDbTeamIds[teamName]) {
+      return sportsDbTeamIds[teamName];
+    }
+    
+    // Try case-insensitive lookup
+    const normalizedName = teamName.trim();
+    const matchingKey = Object.keys(sportsDbTeamIds).find(
+      key => key.toLowerCase() === normalizedName.toLowerCase()
+    );
+    
+    return matchingKey ? sportsDbTeamIds[matchingKey] : null;
   },
   
   /**

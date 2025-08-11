@@ -24,19 +24,29 @@ const config = {
       searchPlayers: '/searchplayers.php',
       eventsNext: '/eventsnext.php',
       eventsLast: '/eventslast.php',
+      eventsNextLeague: '/eventsnextleague.php',
+      eventsPastLeague: '/eventspastleague.php',
+      eventsSeason: '/eventsseason.php',
+      eventsDay: '/eventsday.php',
       lookupTimeline: '/lookuptimeline.php',
       lookupContracts: '/lookupcontracts.php',
       lookupMilestones: '/lookupmilestones.php',
       lookupFormerTeams: '/lookupformerteams.php'
-    }
+    },
+    nflLeagueId: '4391', // NFL League ID for TheSportsDB
+    currentSeason: '2025' // Current NFL season
   },
 
   // OpenAI Configuration
   openai: {
     apiKey: process.env.OPENAI_API_KEY,
-    model: 'gpt-4', // Using GPT-4 as requested
-    maxTokens: 300,
-    temperature: 0.3
+    model: process.env.GPT_MODEL || 'gpt-4o-mini',
+    maxTokens: parseInt(process.env.GPT_MAX_OUTPUT_TOKENS) || 600,
+    temperature: 0.1,
+    enabled: process.env.GPT_ENABLED === 'true',
+    maxInputTokens: parseInt(process.env.GPT_MAX_INPUT_TOKENS) || 3000,
+    runsPerUpdate: parseInt(process.env.GPT_RUNS_PER_UPDATE) || 3,
+    timeoutMs: parseInt(process.env.GPT_TIMEOUT_MS) || 12000
   },
 
   // All 32 NFL Teams for Daily Updates
@@ -90,6 +100,62 @@ const config = {
     evening: '0 20 * * *'    // 8:00 PM EST
   },
   timezone: 'America/New_York',
+  
+  // Schedule Window Configuration
+  schedule: {
+    windowDays: 14,           // 14-day total window (7 days back, 7 days forward)
+    minGamesThreshold: 10,    // Expand window if fewer than 10 games found
+    maxMessagesPerCategory: 5, // Max Discord messages per category
+    pagination: {
+      injuries: 8,            // Items per injuries message
+      roster: 6,              // Items per roster message
+      breaking: 5,            // Items per breaking message
+      games: 15               // Items per games message
+    }
+  },
+
+  // RSS Pipeline Configuration
+  rss: {
+    // Main RSS feed URLs for news aggregation
+    feedUrls: [
+      'https://www.espn.com/espn/rss/nfl/news',
+      'https://www.nfl.com/feeds/news',
+      'https://sports.yahoo.com/nfl/rss.xml',
+      'https://www.cbssports.com/rss/nfl/news',
+      'https://profootballtalk.nbcsports.com/feed/',
+      'https://www.profootballrumors.com/feed'
+    ],
+    
+    // Team-specific feeds (from environment variable if configured)
+    teamFeeds: process.env.TEAM_FEEDS ? process.env.TEAM_FEEDS.split(',').map(url => url.trim()) : [],
+    
+    // Lookback hours by run type
+    lookback: {
+      morning: 24,    // 24h lookback for morning runs
+      afternoon: 12,  // 12h lookback for afternoon runs
+      evening: 12     // 12h lookback for evening runs
+    },
+    
+    // Widened lookback when sections are sparse (<2 items)
+    fallbackLookback: {
+      morning: 48,    // Expand to 48h for sparse morning sections
+      afternoon: 18,  // Expand to 18h for sparse afternoon sections
+      evening: 18     // Expand to 18h for sparse evening sections
+    },
+    
+    // Content extraction settings
+    maxBulletLength: 320,        // Soft limit for bullet length (~320 chars)
+    articleTimeoutMs: 10000,     // 10s timeout for article fetching
+    concurrency: 5,              // Max concurrent article extractions
+    
+    // Category limits
+    limits: {
+      injuries: 20,   // Max 20 injury bullets
+      roster: 12,     // Max 12 roster bullets
+      breaking: 10    // Max 10 breaking news bullets
+    }
+  },
+
   testMode: process.env.TEST_MODE === 'true'
 };
 
