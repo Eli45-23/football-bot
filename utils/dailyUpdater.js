@@ -1,5 +1,6 @@
 const cron = require('node-cron');
 const moment = require('moment-timezone');
+const crypto = require('crypto');
 const sportsdb = require('../api/sportsdb');
 const { fetchFallbackNews } = require('../services/rssFallback');
 const { getCache, setCache } = require('../lib/cache');
@@ -10,6 +11,8 @@ const dedupHashService = require('../utils/dedupHash');
 const aggregateNews = require('../utils/aggregateNews');
 const gptSummarizer = require('../src/services/gptSummarizer.ts');
 const apiQueue = require('../lib/apiQueue');
+const scheduleState = require('../src/state/scheduleState');
+const offlineQueue = require('../src/posting/offlineQueue');
 
 /**
  * NFL Scheduled Updates Service
@@ -34,55 +37,17 @@ class DailyUpdater {
   }
 
   /**
-   * Initialize all 3 daily update cron jobs
+   * Legacy start method - now handled by resilient scheduler
+   * Kept for backward compatibility but shows deprecation notice
    */
   start() {
-    console.log('🕐 Initializing NFL scheduled update system...');
-    
-    if (config.testMode) {
-      console.log('🧪 TEST MODE: Running updates every minute');
-      cron.schedule('* * * * *', async () => {
-        await this.runScheduledUpdate('test');
-      }, {
-        scheduled: true,
-        timezone: config.timezone
-      });
-    } else {
-      // Morning update - 8:00 AM EST
-      cron.schedule(config.cronSchedules.morning, async () => {
-        await this.runScheduledUpdate('morning');
-      }, {
-        scheduled: true,
-        timezone: config.timezone
-      });
-
-      // Afternoon update - 2:00 PM EST  
-      cron.schedule(config.cronSchedules.afternoon, async () => {
-        await this.runScheduledUpdate('afternoon');
-      }, {
-        scheduled: true,
-        timezone: config.timezone
-      });
-
-      // Evening update - 8:00 PM EST
-      cron.schedule(config.cronSchedules.evening, async () => {
-        await this.runScheduledUpdate('evening');
-      }, {
-        scheduled: true,
-        timezone: config.timezone
-      });
-    }
-
-    console.log(`✅ Scheduled updates configured:`);
-    console.log(`   🌅 Morning: ${config.cronSchedules.morning} (8:00 AM EST)`);
-    console.log(`   🌞 Afternoon: ${config.cronSchedules.afternoon} (2:00 PM EST)`);
-    console.log(`   🌙 Evening: ${config.cronSchedules.evening} (8:00 PM EST)`);
-    console.log(`   🌍 Timezone: ${config.timezone}`);
-    console.log(`   📡 Monitoring ${config.nflTeams.length} NFL teams`);
-    console.log(`   📦 Batch size: ${this.batchSize} teams per batch (reduced for rate limits)`);
-    console.log(`   ⏱️  Batch delay: ${this.batchDelayMs/1000}s between batches`);
-    console.log(`   🐌 Team delay: ${this.teamDelayMs}ms between teams`);
-    console.log(`   🎯 Estimated processing time: ~${Math.ceil((config.nflTeams.length / this.batchSize) * (this.batchDelayMs/1000/60))} minutes`);
+    console.log('⚠️ DEPRECATED: Traditional cron scheduling has been replaced by resilient scheduler');
+    console.log('🔄 Scheduling is now handled by the resilient scheduler in index.js');
+    console.log(`📡 Monitoring ${config.nflTeams.length} NFL teams`);
+    console.log(`📦 Batch size: ${this.batchSize} teams per batch (reduced for rate limits)`);
+    console.log(`⏱️  Batch delay: ${this.batchDelayMs/1000}s between batches`);
+    console.log(`🐌 Team delay: ${this.teamDelayMs}ms between teams`);
+    console.log(`🎯 Estimated processing time: ~${Math.ceil((config.nflTeams.length / this.batchSize) * (this.batchDelayMs/1000/60))} minutes`);
   }
 
   /**
@@ -100,11 +65,21 @@ class DailyUpdater {
     const timeStr = now.format('MMMM D, YYYY - h:mm A z');
     
     try {
+      // Idempotency checks before execution
+      const canProceed = await this.checkIdempotency(updateType);
+      if (!canProceed) {
+        console.log(`🔒 Skipping ${updateType} update - idempotency check failed`);
+        return;
+      }
+
       console.log(`🚀 Starting ${updateType} NFL update for ${timeStr}...`);
       console.log(`📊 Processing ${config.nflTeams.length} teams in batches of ${this.batchSize}...`);
       
       // Collect NFL data using batched processing + RSS
       const nflData = await this.collectNFLDataBatched();
+      
+      // Generate content hash for duplicate detection
+      const contentHash = this.generateContentHash(nflData, updateType, timeStr);
       
       // Post categorized updates to Discord (5 separate messages)
       await this.postStaggeredUpdatesToDiscord(nflData, timeStr, updateType);
@@ -112,6 +87,9 @@ class DailyUpdater {
       // Process any deferred API requests with extended delays
       await this.processAPIDeferialsInBackground(updateType);
       
+      // Record successful run in persistent state
+      await scheduleState.setRun(updateType, Date.now());
+      await scheduleState.setLastHash(updateType, contentHash);
       this.lastRuns[updateType] = new Date();
       
       // Log detailed GPT metrics as requested
@@ -623,7 +601,7 @@ class DailyUpdater {
     if (totalItems === 0) {
       // Post empty category section
       const emptyEmbed = this.createNewSectionEmbed(categoryTitle, categoryData);
-      await channel.send({ embeds: [emptyEmbed] });
+      await this.queuedSend(channel, { embeds: [emptyEmbed] }, `empty ${categoryTitle.toLowerCase()}`);
       console.log(`   ${categoryTitle.split(' ')[0]} Posted empty ${categoryTitle.toLowerCase()}`);
       return;
     }
@@ -631,7 +609,7 @@ class DailyUpdater {
     if (totalItems <= itemsPerMessage) {
       // Single message - no chunking needed
       const singleEmbed = this.createNewSectionEmbed(categoryTitle, categoryData);
-      await channel.send({ embeds: [singleEmbed] });
+      await this.queuedSend(channel, { embeds: [singleEmbed] }, `${categoryTitle.toLowerCase()} (single message)`);
       console.log(`   ${categoryTitle.split(' ')[0]} Posted ${categoryTitle.toLowerCase()} (${totalItems} items in 1 message)`);
     } else {
       // Multiple messages - chunk the data
@@ -649,7 +627,7 @@ class DailyUpdater {
         // Add page number to title: "🏥 Injuries (1/3)"
         const pagedTitle = `${categoryTitle} (${i + 1}/${chunks.length})`;
         const chunkEmbed = this.createNewSectionEmbed(pagedTitle, chunkData);
-        await channel.send({ embeds: [chunkEmbed] });
+        await this.queuedSend(channel, { embeds: [chunkEmbed] }, `${categoryTitle.toLowerCase()} chunk ${i + 1}/${chunks.length}`);
         
         // Small delay between chunks
         if (i < chunks.length - 1) {
@@ -695,7 +673,7 @@ class DailyUpdater {
 
       // Header message with run type
       const headerEmbed = this.createHeaderEmbed(timeStr, updateType, nflData);
-      await channel.send({ embeds: [headerEmbed] });
+      await this.queuedSend(channel, { embeds: [headerEmbed] }, `${updateType} header message`);
       console.log(`   📢 Posted header message`);
       await this.sleep(this.messageDelayMs);
 
@@ -717,7 +695,7 @@ class DailyUpdater {
 
       // Footer with sources
       const footerEmbed = this.createSourcesFooterEmbed(nflData);
-      await channel.send({ embeds: [footerEmbed] });
+      await this.queuedSend(channel, { embeds: [footerEmbed] }, `${updateType} sources footer`);
       console.log(`   🗺 Posted sources footer`);
 
       console.log(`✅ Staggered ${updateType} update posted successfully!`);
@@ -997,12 +975,76 @@ class DailyUpdater {
         .setColor(0xFFA500) // Orange color for warnings
         .setTimestamp();
       
-      await channel.send({ embeds: [warningEmbed] });
+      await this.queuedSend(channel, { embeds: [warningEmbed] }, 'deferred failure warning');
       console.log(`⚠️ Posted deferred failure warning for ${failedTeamNames.length} teams`);
       
     } catch (error) {
       console.error('❌ Error posting deferred failure warning:', error.message);
     }
+  }
+
+  /**
+   * Check idempotency before running update (prevent double-posting)
+   * @param {string} updateType - morning|afternoon|evening|test
+   * @returns {boolean} True if update can proceed
+   */
+  async checkIdempotency(updateType) {
+    // Skip idempotency checks for test runs
+    if (updateType === 'test') {
+      console.log('🧪 Test run - skipping idempotency checks');
+      return true;
+    }
+
+    // Check if slot was run recently (within 10 minutes)
+    const withinMs = 10 * 60 * 1000; // 10 minutes
+    const wasRecentlyRun = await scheduleState.wasRecentlyRun(updateType, withinMs);
+    
+    if (wasRecentlyRun) {
+      console.log(`🔒 ${updateType} update was run within last ${withinMs/60000} minutes - skipping to prevent double-post`);
+      return false;
+    }
+
+    console.log(`✅ ${updateType} update idempotency check passed`);
+    return true;
+  }
+
+  /**
+   * Generate content hash for duplicate detection
+   * @param {Object} nflData - NFL data object
+   * @param {string} updateType - Update type
+   * @param {string} timeStr - Time string
+   * @returns {string} SHA-256 hash of content
+   */
+  generateContentHash(nflData, updateType, timeStr) {
+    const contentToHash = {
+      updateType,
+      date: timeStr.split(' - ')[0], // Date part only (ignore exact time)
+      injuryCount: nflData.injuries?.totalCount || 0,
+      rosterCount: nflData.roster?.totalCount || 0,
+      breakingCount: nflData.breakingNews?.totalCount || 0,
+      gameCount: nflData.scheduledGames?.length || 0,
+      // Include a sample of the actual content for more precise detection
+      injurySample: nflData.injuries?.items?.slice(0, 3)?.map(i => i.text?.substring(0, 50)) || [],
+      rosterSample: nflData.roster?.items?.slice(0, 3)?.map(i => i.text?.substring(0, 50)) || []
+    };
+
+    const hash = crypto.createHash('sha256')
+      .update(JSON.stringify(contentToHash))
+      .digest('hex');
+
+    console.log(`🔐 Generated content hash: ${hash.substring(0, 12)}... (${updateType})`);
+    return hash;
+  }
+
+  /**
+   * Create a queued posting function for channel.send()
+   * @param {Channel} channel - Discord channel
+   * @param {Object} content - Message content
+   * @param {string} description - Description for logging
+   * @returns {Promise} Promise for queued send
+   */
+  async queuedSend(channel, content, description = 'message') {
+    return offlineQueue.queuedChannelSend(channel, content, this.client, description);
   }
 
   /**

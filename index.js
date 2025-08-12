@@ -1,6 +1,8 @@
 const { Client, GatewayIntentBits, EmbedBuilder, ActivityType } = require('discord.js');
 const config = require('./config/config');
 const DailyUpdater = require('./utils/dailyUpdater');
+const { getScheduler } = require('./src/scheduler/dailyScheduler');
+const offlineQueue = require('./src/posting/offlineQueue');
 
 /**
  * Production-Grade NFL Discord Bot
@@ -37,7 +39,7 @@ class NFLDiscordBot {
    */
   setupEventHandlers() {
     // Bot ready event
-    this.client.once('ready', () => {
+    this.client.once('ready', async () => {
       console.log('🏈 ===== NFL DISCORD BOT READY =====');
       console.log(`✅ Logged in as ${this.client.user.tag}`);
       console.log(`🤖 Bot ID: ${this.client.user.id}`);
@@ -49,8 +51,14 @@ class NFLDiscordBot {
         type: ActivityType.Watching 
       });
 
-      // Start daily update scheduler
-      this.dailyUpdater.start();
+      // Initialize resilient scheduler instead of basic cron
+      const scheduler = getScheduler();
+      await scheduler.initScheduler(this.client, this.dailyUpdater);
+
+      // Check for missed runs and flush offline queue
+      console.log('🔍 Client ready – checking missed runs and flushing offline queue...');
+      await offlineQueue.flushOfflineQueue(this.client);
+      await scheduler.checkMissedRuns();
       
       console.log('====================================\n');
     });
@@ -84,6 +92,24 @@ class NFLDiscordBot {
 
     this.client.ws.on('RECONNECTING', () => {
       console.log('🔄 Reconnecting to Discord WebSocket...');
+    });
+
+    // Enhanced connection monitoring for resilient scheduling
+    this.client.on('shardDisconnect', (event, id) => {
+      console.warn(`🔌 Shard ${id} disconnect code=${event?.code || 'unknown'}`);
+    });
+
+    this.client.on('shardReady', (id) => {
+      console.log(`✅ Shard ${id} ready`);
+    });
+
+    this.client.on('shardResume', async (id, replayed) => {
+      console.log(`🔄 Shard ${id} resumed (${replayed} events) – checking missed runs...`);
+      
+      // Check for missed runs and flush offline queue on resume
+      const scheduler = getScheduler();
+      await offlineQueue.flushOfflineQueue(this.client);
+      await scheduler.checkMissedRuns();
     });
 
     // Error handling
