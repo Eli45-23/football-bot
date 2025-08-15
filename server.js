@@ -29,7 +29,7 @@ app.get('/', (req, res) => {
 });
 
 // Start the Express server for health checks
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`🌐 Health check server running on port ${PORT}`);
 });
 
