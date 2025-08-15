@@ -3,13 +3,79 @@ services:
     name: nfl-discord-bot
     env: node
     region: oregon
-    plan: starter
+    plan: free
     buildCommand: npm install
-    startCommand: node index.js
+    startCommand: npm start
     healthCheckPath: /health
     envVars:
       - key: NODE_ENV
         value: production
       - key: PORT
         value: 10000
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: DISCORD_CLIENT_ID
+        sync: false
+      - key: DISCORD_GUILD_ID
+        sync: false
+      - key: NFL_UPDATES_CHANNEL_ID
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: SPORTSDB_KEY
+        value: "123"
+      - key: TIMEZONE
+        value: "America/New_York"
+      - key: GPT_ENABLED
+        value: "true"
+      - key: GPT_MODEL
+        value: "gpt-4o-mini"
+      - key: GPT_TEMPERATURE
+        value: "0.1"
+      - key: GPT_MAX_INPUT_TOKENS
+        value: "3000"
+      - key: GPT_MAX_OUTPUT_TOKENS
+        value: "600"
+      - key: GPT_RUNS_PER_UPDATE
+        value: "3"
+      - key: GPT_TIMEOUT_MS
+        value: "12000"
+      - key: GPT_FORCE_MODE
+        value: "true"
+      - key: MISSED_RUN_GRACE_MIN
+        value: "60"
+      - key: OFFLINE_QUEUE_SPACING_MS
+        value: "300"
+      - key: LOOKBACK_HOURS_MORNING
+        value: "24"
+      - key: LOOKBACK_HOURS_AFTERNOON
+        value: "12"
+      - key: LOOKBACK_HOURS_EVENING
+        value: "24"
+      - key: BREAKING_LOOKBACK_EVENING
+        value: "36"
+      - key: RATE_LIMIT_REQUESTS_PER_MINUTE
+        value: "60"
+      - key: RATE_LIMIT_BURST
+        value: "10"
+      - key: RECONNECT_DELAY_MS
+        value: "5000"
+      - key: MAX_RECONNECT_ATTEMPTS
+        value: "5"
+      - key: ENABLE_COMPREHENSIVE_LOGGING
+        value: "true"
+      - key: ENABLE_SCHEDULE_PERSISTENCE
+        value: "true"
+      - key: ENABLE_DUPLICATE_DETECTION
+        value: "true"
+      - key: ENABLE_FALLBACK_EXPANSION
+        value: "true"
+      - key: ENABLE_API_QUEUE
+        value: "true"
+      - key: RSS_FEEDS
+        value: "https://www.espn.com/espn/rss/nfl/news,https://www.nfl.com/rss/rsslanding?searchString=home,https://sports.yahoo.com/nfl/rss.xml,https://www.cbssports.com/rss/headlines/nfl/,https://profootballtalk.nbcsports.com/feed/"
     autoDeploy: true
+    disk:
+      name: nfl-bot-data
+      mountPath: /opt/render/project/src/.data
+      sizeGB: 1

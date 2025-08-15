@@ -31,3 +31,26 @@ coverage/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# Render deployment files
+.render/
+
+# Runtime data files (will be recreated on server)
+.data/lastHash.json
+.data/schedule.json
+.data/lastContent.json
+
+# Debug and test files
+debug-*.js
+test-*.js
+demo-*.js
+show-*.js
+quick-*.js
+run-*.js
+trigger-*.js
+final-*.js
+*-demo.js
+clear-*.js
+get-*.js
+live-*.js
+nfl-schedule-optimization-demo.js
