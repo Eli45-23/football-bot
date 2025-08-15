@@ -23,7 +23,7 @@ class RSSService {
         'https://www.nfl.com/rss/rsslanding?searchString=home',
         'https://sports.yahoo.com/nfl/rss.xml',
         'https://www.cbssports.com/rss/headlines/nfl/',
-        'https://profootballtalk.nbcsports.com/feed/'
+        'https://www.nbcsports.com/profootballtalk.rss'
       ];
 
     // Keyword categorization rules (case-insensitive)
@@ -46,16 +46,22 @@ class RSSService {
     this.breakingKeywords = [
       'breaking', 'sources', 'per source', 'expected to', 'ruled', 
       'announced', 'agrees to', 'agreed', 'extension', 'out indefinitely',
-      'returns', 'returning', 'sidelined', 'season-ending'
+      'returns', 'returning', 'sidelined', 'season-ending', 'retires', 
+      'retirement', 'suspended', 'suspension', 'charged', 'arrested',
+      'surgery', 'named', 'confirmed', 'decision', 'announces',
+      'starts', 'starting', 'benched', 'replaced', 'cleared',
+      'expects', 'ready', 'won\'t face', 'will play', 'won\'t play',
+      'need', 'changes his mind', 'loses', 'Hall of Fame'
     ];
   }
 
   /**
    * Fetch and normalize articles from all RSS feeds
+   * @param {number} lookbackHours - Hours to look back (default 24)
    * @returns {Promise<Array>} Array of normalized articles
    */
-  async fetchAllNews() {
-    console.log(`📰 Fetching RSS from ${this.feeds.length} sources...`);
+  async fetchAllNews(lookbackHours = 24) {
+    console.log(`📰 Fetching RSS from ${this.feeds.length} sources (${lookbackHours}h lookback)...`);
     
     const fetchPromises = this.feeds.map(async (feedUrl) => {
       try {
@@ -63,7 +69,8 @@ class RSSService {
         const sourceName = this.getSourceName(feedUrl);
         
         const articles = feed.items
-          .filter(item => this.isRecent(item.isoDate || item.pubDate))
+          .filter(item => this.isWithinHours(item.isoDate || item.pubDate, lookbackHours))
+          .filter(item => this.isValidBreakingNewsContent(item, lookbackHours)) // Additional filtering for quality
           .map(item => ({
             title: item.title || '',
             link: item.link || '',
@@ -101,7 +108,8 @@ class RSSService {
     const categories = {
       injuries: [],
       roster: [],
-      breaking: []
+      breaking: [],
+      uncategorized: []
     };
 
     articles.forEach(article => {
@@ -113,13 +121,25 @@ class RSSService {
         categories.roster.push(article);
       } else if (this.matchesKeywords(text, this.breakingKeywords)) {
         categories.breaking.push(article);
+      } else {
+        // Keep high-quality uncategorized articles as fallback
+        categories.uncategorized.push(article);
       }
-      // Otherwise ignore (quality over quantity)
     });
+
+    // If breaking news is limited (< 3 items), supplement with general news
+    if (categories.breaking.length < 3 && categories.uncategorized.length > 0) {
+      const fallbackNeeded = Math.min(3 - categories.breaking.length, categories.uncategorized.length);
+      const fallbackItems = categories.uncategorized.slice(0, fallbackNeeded);
+      categories.breaking.push(...fallbackItems);
+      console.log(`📈 Breaking news supplemented with ${fallbackNeeded} general NFL articles`);
+    }
 
     // Apply caps and calculate truncated counts
     const result = {};
     Object.keys(categories).forEach(category => {
+      if (category === 'uncategorized') return; // Don't include in final result
+      
       const items = categories[category];
       result[category] = {
         items: items.slice(0, 5),
@@ -151,15 +171,83 @@ class RSSService {
    * @returns {boolean} True if recent
    */
   isRecent(dateStr) {
+    return this.isWithinHours(dateStr, 24);
+  }
+
+  /**
+   * Check if article is within specified hours (parameterized version)
+   * @param {string} dateStr - ISO date string
+   * @param {number} hours - Hours to look back (default 24)
+   * @returns {boolean} True if within timeframe
+   */
+  isWithinHours(dateStr, hours = 24) {
     if (!dateStr) return false;
     
     try {
       const articleDate = moment(dateStr);
       const hoursAgo = moment().diff(articleDate, 'hours');
-      return hoursAgo <= 24;
+      
+      // Additional filtering for breaking news quality
+      if (hours > 24) {
+        // For extended lookbacks, be more strict about content quality
+        return hoursAgo <= hours && hoursAgo >= 0; // Must be valid future time
+      }
+      
+      return hoursAgo <= hours && hoursAgo >= 0;
     } catch (error) {
       return false;
     }
+  }
+
+  /**
+   * Validate breaking news content quality - filter out poor/stale content
+   * @param {Object} item - RSS feed item
+   * @param {number} lookbackHours - Current lookback period
+   * @returns {boolean} True if valid content
+   */
+  isValidBreakingNewsContent(item, lookbackHours) {
+    if (!item || !item.title) return false;
+    
+    const title = item.title.toLowerCase();
+    const content = (item.contentSnippet || item.content || '').toLowerCase();
+    const fullText = `${title} ${content}`;
+    
+    // Filter out poor quality content patterns
+    const badPatterns = [
+      /last updated/,
+      /^updated:/,
+      /^\s*-\s*last/,
+      /unfortunately, he is out/,
+      /sadly, he is out/,
+      /he is out for now/,
+      /he is out as well/,
+      /he is currently out/,
+      /source: espn\)$/,
+      /\(source: [^)]+\)\s*$/,
+      /^[^a-zA-Z]*\d+\./,  // Starts with numbers (list items)
+      /^\s*new:/           // Starts with "NEW:"
+    ];
+    
+    // Reject if matches bad patterns
+    if (badPatterns.some(pattern => pattern.test(fullText))) {
+      console.log(`   🗑️ Filtered low-quality content: ${title.substring(0, 50)}...`);
+      return false;
+    }
+    
+    // For extended lookbacks (>24h), be extra strict
+    if (lookbackHours > 24) {
+      // Must have substantial content
+      if (title.length < 20) return false;
+      
+      // Must contain meaningful action words
+      const meaningfulWords = ['signs', 'agrees', 'announces', 'injury', 'trade', 'release', 'suspend', 'return', 'contract'];
+      if (!meaningfulWords.some(word => fullText.includes(word))) {
+        console.log(`   🗑️ Filtered non-meaningful content: ${title.substring(0, 50)}...`);
+        return false;
+      }
+    }
+    
+    return true;
   }
 
   /**
@@ -188,7 +276,7 @@ class RSSService {
     if (feedUrl.includes('nfl.com')) return 'NFL.com';
     if (feedUrl.includes('yahoo.com')) return 'Yahoo';
     if (feedUrl.includes('cbssports.com')) return 'CBS';
-    if (feedUrl.includes('profootballtalk.nbcsports.com')) return 'CBS/PFT';
+    if (feedUrl.includes('profootballtalk') || feedUrl.includes('nbcsports.com/profootballtalk')) return 'PFT';
     
     try {
       const url = new URL(feedUrl);

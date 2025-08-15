@@ -1,5 +1,4 @@
 const { OpenAI } = require('openai');
-const { Anthropic } = require('@anthropic-ai/sdk');
 const config = require('../config');
 
 class AIService {
@@ -11,9 +10,18 @@ class AIService {
         apiKey: config.ai.openai.apiKey
       });
     } else if (this.provider === 'anthropic') {
-      this.anthropic = new Anthropic({
-        apiKey: config.ai.anthropic.apiKey
-      });
+      try {
+        const { Anthropic } = require('@anthropic-ai/sdk');
+        this.anthropic = new Anthropic({
+          apiKey: config.ai.anthropic.apiKey
+        });
+      } catch (error) {
+        console.warn('Anthropic SDK not installed, falling back to OpenAI');
+        this.provider = 'openai';
+        this.openai = new OpenAI({
+          apiKey: config.ai.openai.apiKey
+        });
+      }
     }
   }
 

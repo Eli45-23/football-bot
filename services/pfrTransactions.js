@@ -2,12 +2,14 @@ const Parser = require('rss-parser');
 const axios = require('axios');
 const { JSDOM } = require('jsdom');
 const { Readability } = require('@mozilla/readability');
+
 const teamMappings = require('../config/nflTeamMappings');
 
 /**
- * ProFootballRumors Transactions Service
+ * ProFootballRumors Transactions Service with exact formatting
  * Fetches and processes NFL roster transactions from PFR
  */
+
 class PFRTransactionsService {
   constructor() {
     this.parser = new Parser({
@@ -27,429 +29,338 @@ class PFRTransactionsService {
   }
 
   /**
-   * Fetch recent transactions from ProFootballRumors
+   * Fetch recent transactions from ProFootballRumors with exact formatting
    * @param {number} lookbackHours - Hours to look back
-   * @returns {Promise<Array>} Array of transaction objects
+   * @returns {Promise<Object>} Formatted transactions with pagination
    */
   async fetchTransactions(lookbackHours = 24) {
     try {
-      console.log('🔁 Fetching PFR transactions feed...');
+      console.log(`🔁 Fetching PFR transactions feed (${lookbackHours}h lookback)...`);
       
       const feed = await this.parser.parseURL(this.transactionsFeedUrl);
       const cutoffTime = new Date(Date.now() - (lookbackHours * 60 * 60 * 1000));
       
-      // Filter recent items
-      const recentItems = feed.items.filter(item => {
-        const itemDate = new Date(item.isoDate || item.pubDate);
-        return itemDate > cutoffTime;
-      });
+      // PRESEASON MODE: When GPT_FORCE_MODE is on, keep ALL items for content demonstration
+      let recentItems;
+      if (process.env.GPT_FORCE_MODE === 'true') {
+        console.log(`   🎯 PRESEASON MODE: Keeping ALL ${feed.items.length} PFR transactions for GPT processing`);
+        recentItems = feed.items.slice(0, 15); // Take first 15 for processing
+      } else {
+        // Filter recent items
+        recentItems = feed.items.filter(item => {
+          const itemDate = new Date(item.isoDate || item.pubDate || '');
+          return itemDate > cutoffTime;
+        });
+      }
       
       console.log(`   📰 PFR: ${recentItems.length} recent transaction items`);
       
-      // Process each item to extract transaction details
+      // Process each transaction
       const transactions = [];
       
-      for (const item of recentItems.slice(0, 15)) { // Limit to prevent overwhelming
+      for (const item of recentItems.slice(0, 15)) { // Limit to 15 items for performance
         try {
           const transaction = await this.processTransactionItem(item);
           if (transaction) {
             transactions.push(transaction);
           }
         } catch (error) {
-          console.log(`   ❌ Error processing PFR item: ${error.message}`);
+          console.log(`   ❌ Error processing transaction: ${error.message}`);
         }
       }
       
-      // Deduplicate by canonical URL
+      // Deduplicate by URL
       const uniqueTransactions = this.deduplicateTransactions(transactions);
+      console.log(`   🔄 After deduplication: ${uniqueTransactions.length}`);
       
-      console.log(`✅ PFR transactions: ${transactions.length} processed → ${uniqueTransactions.length} unique`);
+      // Format bullets with exact user requirements
+      const formattedBullets = this.formatBulletsExact(uniqueTransactions);
       
-      return uniqueTransactions.slice(0, 12); // Cap to 12 most recent
+      // Cap at 12 MAX and create pages
+      const cappedBullets = formattedBullets.slice(0, 12);
+      const pages = this.createPages(cappedBullets, 12); // All on one page for roster
+      
+      console.log(`✅ PFR transactions: ${uniqueTransactions.length} found → ${cappedBullets.length} formatted`);
+      
+      return {
+        bullets: cappedBullets,
+        totalCount: uniqueTransactions.length,
+        pages: pages,
+        source: 'PFR'
+      };
       
     } catch (error) {
       console.log(`❌ PFR transactions fetch failed: ${error.message}`);
-      return [];
+      return {
+        bullets: [],
+        totalCount: 0,
+        pages: [],
+        source: 'PFR (failed)'
+      };
     }
   }
 
   /**
-   * Process a single transaction RSS item
-   * @param {Object} item - RSS item
-   * @returns {Promise<Object|null>} Transaction object or null
+   * Process a single transaction item
    */
   async processTransactionItem(item) {
-    const canonicalUrl = this.getCanonicalUrl(item.link);
+    const title = item.title || '';
+    const url = this.getCanonicalUrl(item.link || item.url || '');
     
-    // Skip if already seen
-    if (this.seenUrls.has(canonicalUrl)) {
-      return null;
+    if (this.seenUrls.has(url)) {
+      return null; // Skip duplicates
+    }
+    this.seenUrls.add(url);
+    
+    // Extract basic info from title
+    const player = this.extractPlayerName(title);
+    const team = this.extractTeamName(title);
+    const action = this.extractAction(title);
+    
+    if (!player || !team || !action) {
+      return null; // Skip if missing required info
     }
     
-    console.log(`   🔍 Processing: ${item.title?.substring(0, 60)}...`);
-    
-    // Extract basic info from title first
-    const titleInfo = this.extractFromTitle(item.title);
-    if (!titleInfo.hasRosterAction) {
-      console.log(`   🗑️ No roster action in title: ${item.title}`);
-      return null;
-    }
-    
-    // Fetch full article for detailed extraction
-    let fullText = null;
+    // Try to get additional details from article content
+    let extra = undefined;
     try {
-      const response = await axios.get(canonicalUrl, {
-        timeout: 8000,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (compatible; NFL Discord Bot/1.0)'
-        }
-      });
-      
-      fullText = this.extractArticleText(response.data, canonicalUrl);
+      const articleContent = await this.fetchArticleContent(url);
+      extra = this.extractExtraDetails(articleContent, player, team, action);
     } catch (error) {
-      console.log(`   ⚠️ Could not fetch full article: ${error.message}`);
-      // Fall back to title/summary only
-    }
-    
-    // Build transaction object
-    const transaction = this.buildTransaction(item, titleInfo, fullText, canonicalUrl);
-    
-    if (transaction) {
-      this.seenUrls.add(canonicalUrl);
-      return transaction;
-    }
-    
-    return null;
-  }
-
-  /**
-   * Extract roster action info from article title
-   * @param {string} title - Article title
-   * @returns {Object} Title analysis
-   */
-  extractFromTitle(title) {
-    if (!title) return { hasRosterAction: false };
-    
-    const titleLower = title.toLowerCase();
-    const hasRosterAction = this.ROSTER_PATTERNS.test(titleLower);
-    
-    // Extract team and player mentions
-    let team = null;
-    let player = null;
-    
-    // Common PFR title formats:
-    // "Cowboys Sign RB Tony Pollard To Extension"
-    // "Patriots Release WR Nelson Agholor"
-    // "Ravens Claim LB Roquan Smith"
-    
-    // Extract team (usually first word that's a team name)
-    const words = title.split(' ');
-    for (let i = 0; i < Math.min(3, words.length); i++) {
-      const teamAbbr = teamMappings.getTeamAbbr(words[i]);
-      if (teamAbbr) {
-        team = teamAbbr;
-        break;
-      }
-    }
-    
-    // Extract player (look for name patterns after position)
-    const nameMatch = title.match(/\b(?:QB|RB|WR|TE|K|DEF|OL|DL|LB|CB|S)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)/);
-    if (nameMatch) {
-      player = nameMatch[1];
+      // Continue without extra details if article fetch fails
     }
     
     return {
-      hasRosterAction,
-      team,
-      player,
-      rawTitle: title
-    };
-  }
-
-  /**
-   * Extract article text using Readability
-   * @param {string} html - Article HTML
-   * @param {string} url - Article URL
-   * @returns {string|null} Extracted text or null
-   */
-  extractArticleText(html, url) {
-    try {
-      const dom = new JSDOM(html, { url });
-      const document = dom.window.document;
-      
-      // Remove ads and navigation
-      const selectorsToRemove = [
-        '.advertisement', '.ads', '.sidebar', '.nav', '.header', '.footer',
-        '.related-posts', '.comments', '.social-share'
-      ];
-      
-      selectorsToRemove.forEach(selector => {
-        const elements = document.querySelectorAll(selector);
-        elements.forEach(el => el.remove());
-      });
-      
-      const reader = new Readability(document);
-      const readableContent = reader.parse();
-      
-      if (readableContent?.textContent) {
-        return this.cleanArticleText(readableContent.textContent);
-      }
-      
-      return null;
-    } catch (error) {
-      console.log(`   ❌ Text extraction failed: ${error.message}`);
-      return null;
-    }
-  }
-
-  /**
-   * Clean extracted article text
-   * @param {string} text - Raw text
-   * @returns {string} Cleaned text
-   */
-  cleanArticleText(text) {
-    if (!text) return '';
-    
-    return text
-      // Remove author bylines
-      .replace(/^By [A-Za-z\s]+,?\s*/m, '')
-      .replace(/^[A-Za-z\s]+ \| [A-Za-z\s]+ \|/m, '')
-      // Remove common boilerplate
-      .replace(/Follow .+ on Twitter/gi, '')
-      .replace(/Subscribe to .+/gi, '')
-      .replace(/More: .+/gi, '')
-      // Clean whitespace
-      .replace(/\n\s*\n\s*\n/g, '\n\n')
-      .replace(/^\s+|\s+$/g, '')
-      .replace(/[ \t]+/g, ' ');
-  }
-
-  /**
-   * Build transaction object from extracted data
-   * @param {Object} item - RSS item
-   * @param {Object} titleInfo - Extracted title info
-   * @param {string} fullText - Full article text
-   * @param {string} canonicalUrl - Canonical URL
-   * @returns {Object|null} Transaction object or null
-   */
-  buildTransaction(item, titleInfo, fullText, canonicalUrl) {
-    // Extract full report sentence instead of just action phrase
-    const reportSentence = this.extractReportSentence(titleInfo.rawTitle, fullText);
-    if (!reportSentence) return null;
-    
-    const team = titleInfo.team || this.extractTeamFromText(reportSentence);
-    const player = titleInfo.player || this.extractPlayerFromText(reportSentence);
-    
-    // Build the bullet with full sentence: "TEAM — <full sentence> (PFR)"
-    let bullet = '';
-    if (team && reportSentence) {
-      // Ensure team is uppercase
-      const teamUpper = team.toUpperCase();
-      const cleanSentence = this.cleanSentenceForBullet(reportSentence, player);
-      bullet = `${teamUpper} — ${cleanSentence}`;
-    } else if (reportSentence) {
-      bullet = this.cleanSentenceForBullet(reportSentence, player);
-    } else {
-      return null;
-    }
-    
-    // Check if there's a meaningful second sentence with contract details
-    if (fullText) {
-      const secondSentence = this.extractSecondSentenceWithDetails(fullText, reportSentence);
-      if (secondSentence && (bullet.length + secondSentence.length + 3) <= 320) {
-        bullet += `; ${secondSentence}`;
-      }
-    }
-    
-    // Add PFR source
-    bullet += ' (PFR)';
-    
-    // Format properly
-    bullet = this.formatBullet(bullet);
-    
-    if (!bullet || bullet.length < 10) return null;
-    
-    return {
-      title: item.title,
-      url: canonicalUrl,
-      date: item.isoDate || item.pubDate,
-      team,
-      player,
-      reportSentence,
-      bullet,
+      title: title,
+      url: url,
+      date: item.isoDate || item.pubDate || '',
+      team: team,
+      player: player,
+      action: action,
+      extra: extra,
+      bullet: '', // Will be formatted later
       source: 'PFR',
       category: 'roster'
     };
   }
 
   /**
-   * Extract action phrase from title/text
-   * @param {string} title - Article title
-   * @param {string} fullText - Full article text
-   * @returns {string|null} Action phrase or null
+   * Format bullets with exact user-specified format
+   * bullet: `${TEAM} — ${Action} ${Player}${extra ? "; "+extra : ""} (PFR)`
    */
-  extractActionPhrase(title, fullText) {
-    // Try title first (usually contains the action)
-    const titlePhrase = this.findActionPhrase(title);
-    if (titlePhrase) return titlePhrase;
-    
-    // Try first few sentences of article
-    if (fullText) {
-      const sentences = fullText.split(/[.!?]+/).slice(0, 3);
-      for (const sentence of sentences) {
-        const phrase = this.findActionPhrase(sentence);
-        if (phrase) return phrase;
-      }
-    }
-    
-    return null;
+  formatBulletsExact(transactions) {
+    return transactions.map(transaction => {
+      // Normalize fields as specified
+      const TEAM = transaction.team.toUpperCase();
+      const Action = this.sentenceCase(transaction.action);
+      const Player = this.titleCaseName(transaction.player);
+      const extraText = transaction.extra ? `; ${transaction.extra}` : '';
+      
+      // Exact format as specified
+      return `${TEAM} — ${Action} ${Player}${extraText} (PFR)`;
+    }).filter(bullet => bullet.length > 0);
   }
 
   /**
-   * Find action phrase in text
-   * @param {string} text - Text to search
-   * @returns {string|null} Action phrase or null
+   * Extract player name from title
    */
-  findActionPhrase(text) {
-    if (!text) return null;
+  extractPlayerName(title) {
+    // First, exclude team names from being detected as player names
+    const teamWords = /^(bills|chargers|browns|eagles|saints|dolphins|texans|titans|jets|chiefs|raiders|steelers|cowboys|packers|patriots|49ers|rams|seahawks|cardinals|panthers|falcons|bucs|jaguars|colts|bengals|lions|bears|vikings|commanders|giants)\s/i;
     
-    const textLower = text.toLowerCase();
-    
-    // Common PFR patterns
-    const patterns = [
-      /\b(sign(?:ed)?|signed)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)/i,
-      /\b(waive(?:d)?|waived)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)/i,
-      /\b(release(?:d)?|released)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)/i,
-      /\b(trade(?:d)?|traded)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)/i,
-      /\b(claim(?:ed)?|claimed)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)/i,
-      /\b(activate(?:d)?|activated)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)/i,
-      /\b(place(?:d)?)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+on\s+ir/i
+    // Enhanced patterns for better name extraction
+    const namePatterns = [
+      // Specific extraction from context (avoid team names)
+      /(?:sign|signed|agrees?|traded?|claimed?|waived?|released?|activated?|placed?)\s+(?:free\s+agent\s+)?(?:rb|qb|wr|te|lb|de|dt|cb|s|ol|k|p)?\s*([A-Z][a-z]+\s+[A-Z][a-z]+)(?!\s+(?:lose|sign|place|agree))/i,
+      
+      // Comma-separated format: "Bills, James Cook Agree"
+      /[a-zA-Z]+,\s+([A-Z][a-z]+\s+[A-Z][a-z]+)(?:\s+(?:Agree|sign|extend))/i,
+      
+      // Position-specific: "Eagles LG Landon Dickerson"  
+      /[a-zA-Z]+\s+(?:RB|QB|LG|OL|WR|TE|DE|LB|CB|S|K|P)\s+([A-Z][a-z]+\s+[A-Z][a-z]+)/i,
+      
+      // Age-based context: "33-Year-Old Veteran John Smith"
+      /\d{2}-year-old\s+(?:veteran\s+)?([A-Z][a-z]+\s+[A-Z][a-z]+)/i,
+      
+      // Contract context: "Player Name signs $X million deal"
+      /^([A-Z][a-z]+\s+[A-Z][a-z]+)(?:\s+signs?\s+|\s+agrees?\s+to\s+|\s+gets?\s+)/i,
+      
+      // Standard names that don't start with team words
+      /\b([A-Z][a-z]+\s+[A-Z][a-z]+)(?:\s+(?:Jr|Sr|III|IV))?\b/
     ];
     
-    for (const pattern of patterns) {
-      const match = text.match(pattern);
-      if (match) {
-        const action = match[1];
-        const player = match[2];
-        return `${action} ${player}`.toLowerCase();
-      }
-    }
-    
-    // Fallback: just return first sentence if it has roster keywords
-    if (this.ROSTER_PATTERNS.test(textLower)) {
-      const firstSentence = text.split(/[.!?]/)[0].trim();
-      return firstSentence.length > 10 ? firstSentence : null;
-    }
-    
-    return null;
-  }
-
-  /**
-   * Extract team from text
-   * @param {string} text - Text to search
-   * @returns {string|null} Team abbreviation or null
-   */
-  extractTeamFromText(text) {
-    if (!text) return null;
-    
-    const words = text.split(/\s+/).slice(0, 20); // Check first 20 words
-    for (const word of words) {
-      const teamAbbr = teamMappings.getTeamAbbr(word);
-      if (teamAbbr) return teamAbbr;
-    }
-    
-    return null;
-  }
-
-  /**
-   * Extract player from text
-   * @param {string} text - Text to search
-   * @returns {string|null} Player name or null
-   */
-  extractPlayerFromText(text) {
-    if (!text) return null;
-    
-    // Look for name patterns
-    const namePattern = /\b([A-Z][a-z]+'?\s+[A-Z][a-z]+)\b/g;
-    const matches = text.match(namePattern);
-    
-    if (matches && matches.length > 0) {
-      // Return first name that's not a team name
-      for (const match of matches) {
-        if (!teamMappings.getTeamAbbr(match)) {
-          return match;
+    for (const pattern of namePatterns) {
+      const match = title.match(pattern);
+      if (match && match[1]) {
+        const name = match[1].trim();
+        
+        // Validate it's not a team name or common word
+        if (name.length > 2 && 
+            !teamWords.test(name) &&
+            !/^(player|veteran|free|agent|linebacker|running|back|wide|receiver|defensive|offensive)$/i.test(name.split(' ')[0]) &&
+            !/^(contract|extension|injury|deal|million|dollar|year)$/i.test(name.split(' ')[1] || '')) {
+          return name;
         }
       }
     }
     
+    // Enhanced fallback: Try to extract from broader context
+    const fallbackMatch = title.match(/([A-Z][a-z]{2,}\s+[A-Z][a-z]{2,})/);
+    if (fallbackMatch && !teamWords.test(fallbackMatch[1])) {
+      return fallbackMatch[1];
+    }
+    
+    // If no specific name found, return generic placeholder  
+    return 'Player';
+  }
+
+  /**
+   * Extract team name/abbreviation from title
+   */
+  extractTeamName(title) {
+    // Look for team abbreviations or full names
+    const teamPattern = /\b(Cardinals|Falcons|Ravens|Bills|Panthers|Bears|Bengals|Browns|Cowboys|Broncos|Lions|Packers|Texans|Colts|Jaguars|Chiefs|Dolphins|Vikings|Patriots|Saints|Giants|Jets|Eagles|Steelers|Chargers|49ers|Seahawks|Rams|Bucs|Titans|Commanders|Raiders|WAS|NYG|NYJ|NE|BUF|MIA|BAL|PIT|CIN|CLE|HOU|IND|JAX|TEN|DEN|KC|LV|LAC|LAR|SEA|SF|AZ|GB|MIN|CHI|DET|CAR|NO|ATL|TB|PHI|DAL)\b/i;
+    
+    const match = title.match(teamPattern);
+    if (match) {
+      const team = match[1];
+      // Convert full names to abbreviations if needed
+      const abbr = this.getTeamAbbreviation(team);
+      return abbr || team;
+    }
+    
     return null;
   }
 
   /**
-   * Convert text to sentence case (first letter uppercase, rest lowercase)
-   * @param {string} text - Text to convert
-   * @returns {string} Sentence case text
+   * Extract action from title
    */
-  toSentenceCase(text) {
-    if (!text) return '';
+  extractAction(title) {
+    const match = title.match(this.ROSTER_PATTERNS);
+    if (match) {
+      let action = match[1].toLowerCase();
+      
+      // Normalize common variations
+      if (action.includes('sign')) {
+        action = action.includes('re') ? 'Re-signed' : 'Signed';
+      } else if (action.includes('waive')) {
+        action = 'Waived';
+      } else if (action.includes('release')) {
+        action = 'Released';
+      } else if (action.includes('trade')) {
+        action = 'Traded';
+      } else if (action.includes('claim')) {
+        action = 'Claimed';
+      } else if (action.includes('promote')) {
+        action = 'Promoted';
+      } else if (action.includes('elevate')) {
+        action = 'Elevated';
+      } else if (action.includes('activate')) {
+        action = 'Activated';
+      } else if (action.includes('ir')) {
+        action = 'Placed on IR';
+      } else if (action.includes('return')) {
+        action = 'Designated to return';
+      }
+      
+      return action;
+    }
     
-    const trimmed = text.trim();
-    if (trimmed.length === 0) return '';
-    
-    return trimmed.charAt(0).toUpperCase() + trimmed.slice(1).toLowerCase();
+    return 'Roster move';
   }
 
   /**
-   * Format bullet with proper length and punctuation
-   * @param {string} bullet - Raw bullet
-   * @returns {string} Formatted bullet
+   * Fetch article content for additional details
    */
-  formatBullet(bullet) {
-    if (!bullet) return '';
+  async fetchArticleContent(url) {
+    const response = await axios.get(url, {
+      timeout: 8000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; NFL Discord Bot/1.0)'
+      }
+    });
     
-    let formatted = bullet.trim();
+    const dom = new JSDOM(response.data, { url });
+    const reader = new Readability(dom.window.document);
+    const article = reader.parse();
     
-    // Ensure proper capitalization
-    formatted = formatted.charAt(0).toUpperCase() + formatted.slice(1);
+    return article?.textContent || '';
+  }
+
+  /**
+   * Extract additional details from article content
+   */
+  extractExtraDetails(content, player, team, action) {
+    if (!content) return undefined;
     
-    // Truncate if too long
-    if (formatted.length > 320) {
-      const truncated = formatted.substring(0, 317);
-      const lastSpace = truncated.lastIndexOf(' ');
-      formatted = (lastSpace > 250 ? truncated.substring(0, lastSpace) : truncated) + '...';
-    }
+    // Look for contract details, conditions, etc.
+    const detailPatterns = [
+      /\$[\d,]+(?:\.\d+)?\s*(?:million|M)/i,
+      /\d+[- ]year/i,
+      /practice squad/i,
+      /injured reserve/i,
+      /futures contract/i,
+      /conditional/i,
+      /pending physical/i
+    ];
     
-    // Ensure it doesn't end mid-word
-    if (!formatted.match(/[.!?)\]]$/)) {
-      if (formatted.match(/\([A-Z]+\)$/)) {
-        // Ends with source citation, that's fine
-      } else {
-        formatted += '.';
+    for (const pattern of detailPatterns) {
+      const match = content.match(pattern);
+      if (match) {
+        return match[0];
       }
     }
     
-    return formatted;
+    return undefined;
   }
 
   /**
-   * Deduplicate transactions by canonical URL
-   * @param {Array} transactions - Array of transactions
-   * @returns {Array} Unique transactions
+   * Get team abbreviation from full name
+   */
+  getTeamAbbreviation(teamName) {
+    const mapping = {
+      'Cardinals': 'AZ', 'Falcons': 'ATL', 'Ravens': 'BAL', 'Bills': 'BUF',
+      'Panthers': 'CAR', 'Bears': 'CHI', 'Bengals': 'CIN', 'Browns': 'CLE',
+      'Cowboys': 'DAL', 'Broncos': 'DEN', 'Lions': 'DET', 'Packers': 'GB',
+      'Texans': 'HOU', 'Colts': 'IND', 'Jaguars': 'JAX', 'Chiefs': 'KC',
+      'Dolphins': 'MIA', 'Vikings': 'MIN', 'Patriots': 'NE', 'Saints': 'NO',
+      'Giants': 'NYG', 'Jets': 'NYJ', 'Eagles': 'PHI', 'Steelers': 'PIT',
+      'Chargers': 'LAC', '49ers': 'SF', 'Seahawks': 'SEA', 'Rams': 'LAR',
+      'Bucs': 'TB', 'Titans': 'TEN', 'Commanders': 'WAS', 'Raiders': 'LV'
+    };
+    
+    return mapping[teamName] || null;
+  }
+
+  /**
+   * Create pages of transactions
+   */
+  createPages(bullets, pageSize) {
+    const pages = [];
+    
+    for (let i = 0; i < bullets.length; i += pageSize) {
+      pages.push(bullets.slice(i, i + pageSize));
+    }
+    
+    return pages;
+  }
+
+  /**
+   * Deduplicate transactions by URL
    */
   deduplicateTransactions(transactions) {
     const seen = new Set();
     return transactions.filter(transaction => {
-      const key = transaction.url;
-      if (seen.has(key)) return false;
-      seen.add(key);
+      if (seen.has(transaction.url)) {
+        return false;
+      }
+      seen.add(transaction.url);
       return true;
     });
   }
 
   /**
-   * Get canonical URL
-   * @param {string} url - Original URL
-   * @returns {string} Canonical URL
+   * Get canonical URL (remove tracking params)
    */
   getCanonicalUrl(url) {
     if (!url) return '';
@@ -460,151 +371,45 @@ class PFRTransactionsService {
       const paramsToRemove = ['utm_source', 'utm_medium', 'utm_campaign'];
       paramsToRemove.forEach(param => urlObj.searchParams.delete(param));
       return urlObj.toString();
-    } catch {
+    } catch (error) {
       return url;
     }
   }
 
   /**
+   * Convert name to proper title case (John Doe Jr.)
+   */
+  titleCaseName(name) {
+    if (!name) return '';
+    
+    return name.toLowerCase().replace(/\b\w+/g, (word) => {
+      // Handle special cases like Jr., Sr., III
+      if (['jr', 'sr', 'iii', 'iv'].includes(word.toLowerCase())) {
+        return word.toUpperCase();
+      }
+      
+      return word.charAt(0).toUpperCase() + word.slice(1);
+    });
+  }
+
+  /**
+   * Convert action to sentence case
+   */
+  sentenceCase(action) {
+    if (!action) return '';
+    
+    return action.charAt(0).toUpperCase() + action.slice(1).toLowerCase();
+  }
+
+  /**
    * Get service status
-   * @returns {Object} Status information
    */
   getStatus() {
     return {
       transactionsFeedUrl: this.transactionsFeedUrl,
       seenUrls: this.seenUrls.size,
-      patterns: {
-        roster: this.ROSTER_PATTERNS.toString()
-      }
+      source: 'PFR'
     };
-  }
-
-  /**
-   * Extract full report sentence from title/text (enhanced for full sentences)
-   * @param {string} title - Article title
-   * @param {string} fullText - Full article text
-   * @returns {string|null} Complete report sentence or null
-   */
-  extractReportSentence(title, fullText) {
-    // Try to find complete sentence in title first
-    const titleSentence = this.findCompleteSentence(title);
-    if (titleSentence) return titleSentence;
-    
-    // Try first few sentences of article for complete transactions
-    if (fullText) {
-      const sentences = this.splitSentences(fullText).slice(0, 5);
-      for (const sentence of sentences) {
-        if (this.ROSTER_PATTERNS.test(sentence.toLowerCase()) && 
-            sentence.length > 15 && sentence.length <= 280) {
-          return this.cleanSentenceForBullet(sentence);
-        }
-      }
-    }
-    
-    return null;
-  }
-
-  /**
-   * Find complete sentence with roster action
-   * @param {string} text - Text to search
-   * @returns {string|null} Complete sentence or null
-   */
-  findCompleteSentence(text) {
-    if (!text || !this.ROSTER_PATTERNS.test(text.toLowerCase())) return null;
-    
-    // If the whole text is already a sentence-like structure, use it
-    if (text.length <= 280 && text.length > 15) {
-      return text;
-    }
-    
-    return null;
-  }
-
-  /**
-   * Split text into proper sentences
-   * @param {string} text - Text to split
-   * @returns {Array} Array of sentences
-   */
-  splitSentences(text) {
-    if (!text) return [];
-    
-    // Handle abbreviations
-    const abbreviations = ['Jr.', 'Sr.', 'Dr.', 'Mr.', 'Mrs.', 'Ms.', 'U.S.', 'N.F.L.'];
-    let processedText = text;
-    const placeholders = {};
-    
-    abbreviations.forEach((abbr, index) => {
-      const placeholder = `__ABBR${index}__`;
-      if (processedText.includes(abbr)) {
-        placeholders[placeholder] = abbr;
-        processedText = processedText.replace(new RegExp(abbr.replace('.', '\\.'), 'g'), placeholder);
-      }
-    });
-    
-    // Split on sentence boundaries
-    const sentences = processedText
-      .split(/[.!?]+\s+(?=[A-Z])/)
-      .map(sentence => {
-        let restored = sentence.trim();
-        Object.entries(placeholders).forEach(([placeholder, original]) => {
-          restored = restored.replace(new RegExp(placeholder, 'g'), original);
-        });
-        return restored;
-      })
-      .filter(s => s.length > 10);
-    
-    return sentences;
-  }
-
-  /**
-   * Clean sentence for bullet formatting
-   * @param {string} sentence - Raw sentence
-   * @param {string} player - Player name to avoid repetition
-   * @returns {string} Cleaned sentence
-   */
-  cleanSentenceForBullet(sentence, player = null) {
-    if (!sentence) return '';
-    
-    let cleaned = sentence
-      // Remove bylines
-      .replace(/^By [A-Za-z\s]+,?\s*/i, '')
-      // Remove common prefixes
-      .replace(/^(The\s+)?[A-Z\s]+ (announced|confirmed|reported)\s+/i, '')
-      // Clean whitespace
-      .replace(/\s+/g, ' ')
-      .trim();
-    
-    // Ensure proper sentence case
-    if (cleaned.length > 0) {
-      cleaned = cleaned.charAt(0).toUpperCase() + cleaned.slice(1).toLowerCase();
-    }
-    
-    return cleaned;
-  }
-
-  /**
-   * Extract second sentence with contract/IR details
-   * @param {string} fullText - Full article text
-   * @param {string} firstSentence - First sentence already extracted
-   * @returns {string|null} Second sentence with details or null
-   */
-  extractSecondSentenceWithDetails(fullText, firstSentence) {
-    if (!fullText) return null;
-    
-    const sentences = this.splitSentences(fullText);
-    const firstIndex = sentences.findIndex(s => s.includes(firstSentence.substring(0, 20)));
-    
-    if (firstIndex >= 0 && firstIndex < sentences.length - 1) {
-      const secondSentence = sentences[firstIndex + 1];
-      
-      // Check if second sentence contains meaningful contract/IR terms
-      const meaningfulTerms = /\b(contract|terms|year|million|practice squad|ir|extension|guaranteed|deal|agreement)\b/i;
-      if (meaningfulTerms.test(secondSentence) && secondSentence.length <= 150) {
-        return this.cleanSentenceForBullet(secondSentence);
-      }
-    }
-    
-    return null;
   }
 }
 

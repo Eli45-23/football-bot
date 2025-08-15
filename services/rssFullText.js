@@ -40,6 +40,70 @@ class RSSFullTextService {
   }
 
   /**
+   * Validate breaking news content quality - filter out poor/stale content
+   * @param {Object} item - RSS feed item
+   * @param {number} lookbackHours - Current lookback period
+   * @returns {boolean} True if valid content
+   */
+  isValidBreakingNewsContent(item, lookbackHours) {
+    if (!item || !item.title) return false;
+    
+    const title = item.title.toLowerCase();
+    const content = (item.contentSnippet || item.content || '').toLowerCase();
+    const fullText = `${title} ${content}`;
+    
+    // Filter out poor quality content patterns  
+    const badPatterns = [
+      /last updated/,
+      /^updated:/,
+      /^\s*-\s*last/,
+      /unfortunately, he is out/,
+      /sadly, he is out/,
+      /he is out for now/,
+      /he is out as well/,
+      /he is currently out/,
+      /source: espn\)$/,
+      /\(source: [^)]+\)\s*$/,
+      /^[^a-zA-Z]*\d+\./,  // Starts with numbers (list items)
+      /^\s*new:/,          // Starts with "NEW:"
+      /february \d/,       // February dates (likely stale)
+      /\d{4}-02-/,         // February ISO dates
+      /january \d/,        // January dates (also stale)
+      /december \d/,       // December dates (also stale)
+      /march \d/,          // March dates (stale for August)
+      /april \d/,          // April dates (stale for August)
+      /may \d/,            // May dates (stale for August)  
+      /june \d/,           // June dates (potentially stale)
+      /february 9/,        // Explicit "February 9" filter
+      /feb 9/,             // Explicit "Feb 9" filter
+      /last updated february/,  // "Last updated February"
+      /last updated feb/        // "Last updated Feb"
+    ];
+    
+    // Reject if matches bad patterns
+    const matchedPattern = badPatterns.find(pattern => pattern.test(fullText));
+    if (matchedPattern) {
+      console.log(`   🗑️ RSS FILTER ACTIVE: "${title.substring(0, 50)}..." matched pattern: ${matchedPattern}`);
+      return false;
+    }
+    
+    // For extended lookbacks (>24h), be extra strict
+    if (lookbackHours > 24) {
+      // Must have substantial content
+      if (title.length < 20) return false;
+      
+      // Must contain meaningful action words
+      const meaningfulWords = ['signs', 'agrees', 'announces', 'injury', 'trade', 'release', 'suspend', 'return', 'contract'];
+      if (!meaningfulWords.some(word => fullText.includes(word))) {
+        console.log(`   🗑️ Filtered non-meaningful RSS content: ${title.substring(0, 50)}...`);
+        return false;
+      }
+    }
+    
+    return true;
+  }
+
+  /**
    * Fetch and process RSS feeds with full article content
    * @param {number} lookbackHours - How far back to look for articles
    * @returns {Promise<Array>} Array of articles with full text content
@@ -54,10 +118,15 @@ class RSSFullTextService {
         const feed = await this.parser.parseURL(feedUrl);
         const sourceName = this.deriveSourceShort(feedUrl);
         
-        // Filter recent articles
+        // Filter recent articles with quality filtering
         const recentItems = feed.items.filter(item => {
           const itemDate = moment(item.isoDate || item.pubDate);
-          return itemDate.isAfter(cutoffTime);
+          const isRecent = itemDate.isAfter(cutoffTime);
+          
+          if (!isRecent) return false;
+          
+          // Additional quality filtering for breaking news content
+          return this.isValidBreakingNewsContent(item, lookbackHours);
         });
         
         console.log(`   📰 ${sourceName}: ${recentItems.length} recent items`);

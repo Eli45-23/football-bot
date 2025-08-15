@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const scheduleState = require('../src/state/scheduleState');
 
 /**
  * Payload Deduplication Service
@@ -16,37 +17,128 @@ class DedupHashService {
   }
 
   /**
-   * Generate a hash for the payload content (excluding timestamps)
-   * @param {Object} payload - Payload object to hash
+   * Generate a comprehensive hash for update content including schedule data
+   * @param {Object} nflData - Complete NFL data object
+   * @param {string} updateType - Update type (morning/afternoon/evening)
+   * @param {string} timeStr - Formatted time string
    * @returns {string} SHA256 hash
    */
-  makePayloadHash(payload) {
+  generateContentHash(nflData, updateType, timeStr) {
     try {
-      // Create a copy without timestamp fields to focus on content
+      // Enhanced content hashing with all relevant data
       const contentForHash = {
-        injuries: payload.injuries?.items || [],
-        roster: payload.roster?.items || [],
-        schedule: payload.schedule?.items || [],
-        breaking: payload.breaking?.items || [],
-        // Include counts but not timestamps
-        injuryCount: payload.injuries?.totalCount || 0,
-        rosterCount: payload.roster?.totalCount || 0,
-        scheduleCount: payload.schedule?.totalCount || 0,
-        breakingCount: payload.breaking?.totalCount || 0
+        // Core content
+        injuries: this.normalizeForHash(nflData.injuries?.items || []),
+        roster: this.normalizeForHash(nflData.roster?.items || []),
+        schedule: this.normalizeForHash(nflData.scheduledGames || []),
+        breaking: this.normalizeForHash(nflData.breaking?.items || []),
+        
+        // Metadata that affects content
+        updateType,
+        injuryCount: nflData.injuries?.totalCount || 0,
+        rosterCount: nflData.roster?.totalCount || 0,
+        scheduleCount: nflData.totalGames || 0,
+        breakingCount: nflData.breaking?.totalCount || 0,
+        
+        // Schedule-specific data
+        windowUsed: nflData.windowUsed,
+        windowExpanded: nflData.windowExpanded,
+        dateGrouping: nflData.dateGrouping,
+        
+        // GPT usage affects content
+        gptEnabled: process.env.GPT_ENABLED === 'true'
       };
 
       const contentString = JSON.stringify(contentForHash, null, 0);
       const hash = crypto.createHash('sha256').update(contentString).digest('hex');
       
-      return hash.substring(0, 12); // Use first 12 chars for readability
+      return hash.substring(0, 16); // Use first 16 chars for better uniqueness
     } catch (error) {
-      console.error('❌ Error generating payload hash:', error);
-      return Date.now().toString(); // Fallback to timestamp
+      console.error('❌ Error generating content hash:', error);
+      return `${updateType}_${Date.now()}`; // Fallback with type and timestamp
     }
+  }
+  
+  /**
+   * Normalize content for consistent hashing
+   * @param {Array} items - Items to normalize
+   * @returns {Array} Normalized items
+   */
+  normalizeForHash(items) {
+    if (!Array.isArray(items)) return [];
+    
+    return items.map(item => {
+      if (typeof item === 'string') {
+        // Remove timestamps and source attributions for content comparison
+        return item
+          .replace(/\(\d+[hm] ago\)/g, '(recent)')
+          .replace(/Updated \d+[hm] ago/g, 'Updated recently')
+          .replace(/Updated [A-Z][a-z]{2} \d+/g, 'Updated recently')
+          .replace(/\([A-Z]+\)$/g, '(SOURCE)'); // Normalize source attribution
+      }
+      return item;
+    }).sort(); // Sort for consistent ordering
+  }
+  
+  /**
+   * Legacy method for backward compatibility
+   * @param {Object} payload - Payload object to hash
+   * @returns {string} SHA256 hash
+   */
+  makePayloadHash(payload) {
+    // Convert to new format for compatibility
+    const nflData = {
+      injuries: payload.injuries,
+      roster: payload.roster,
+      scheduledGames: payload.schedule?.items || [],
+      breaking: payload.breaking,
+      totalGames: payload.schedule?.totalCount || 0
+    };
+    
+    return this.generateContentHash(nflData, 'legacy', '');
   }
 
   /**
-   * Check if a payload hash was recently posted
+   * Enhanced duplicate check with persistent state integration
+   * @param {string} hash - Hash to check
+   * @param {string} updateType - Update type for persistent checking
+   * @returns {Promise<boolean>} True if duplicate (should skip posting)
+   */
+  async isDuplicateEnhanced(hash, updateType) {
+    const now = Date.now();
+    
+    // Clean up old hashes first
+    this.pruneOldHashes(now);
+    
+    // Check recent in-memory hashes (short-term)
+    if (this.recentHashes.has(hash)) {
+      const timestamp = this.recentHashes.get(hash);
+      const ageMs = now - timestamp;
+      
+      if (ageMs < this.dedupeWindowMs) {
+        console.log(`🚫 Duplicate content detected (hash: ${hash}, age: ${Math.round(ageMs/1000)}s)`);
+        return true;
+      }
+    }
+    
+    // Check persistent state for longer-term duplicate detection
+    if (updateType && process.env.ENABLE_DUPLICATE_DETECTION === 'true') {
+      try {
+        const lastHash = await scheduleState.getLastHash(updateType);
+        if (lastHash === hash) {
+          console.log(`🚫 Content unchanged since last ${updateType} update (hash: ${hash})`);
+          return true;
+        }
+      } catch (error) {
+        console.warn(`⚠️ Could not check persistent hash for ${updateType}:`, error.message);
+      }
+    }
+    
+    return false;
+  }
+  
+  /**
+   * Legacy method for backward compatibility
    * @param {string} hash - Hash to check
    * @returns {boolean} True if duplicate (should skip posting)
    */

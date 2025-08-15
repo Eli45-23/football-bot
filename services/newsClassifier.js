@@ -7,10 +7,13 @@ const teamMappings = require('../config/nflTeamMappings');
  */
 class NewsClassifierService {
   constructor() {
-    // Strict patterns for enhanced matching
-    this.INJURY_PATTERNS = /(injur(?:y|ed)|carted off|out for season|out indefinitely|questionable|doubtful|inactive(?:s)?|ruled out|limited practice|did not practice|concussion|hamstring|ankle|knee|groin|back|shoulder|wrist|foot|pup|physically unable|placed on ir|activated from ir|designated to return)/i;
+    // Strict patterns for enhanced matching - FIXED: Removed overlap between injury and roster
+    this.INJURY_PATTERNS = /(injur(?:y|ed)|carted off|out for season|out indefinitely|questionable|doubtful|inactive(?:s)?|ruled out|limited practice|did not practice|concussion|hamstring|ankle|knee|groin|back|shoulder|wrist|foot|pup|physically unable)/i;
     
-    this.ROSTER_PATTERNS = /(sign(?:ed|s)?|re[- ]?sign(?:ed|s)?|waive(?:d|s)?|release(?:d|s)?|trade(?:d|s)?|acquire(?:d|s)?|promote(?:d|s)?|elevate(?:d|s)?|claim(?:ed|s)?|activate(?:d|s)?|place(?:d)? on ir|designate(?:d)? to return|agreement|one-year deal|two-year deal|extension)/i;
+    // Injury-specific activation (separate from general roster activation)
+    this.INJURY_IR_PATTERNS = /(placed on ir|activated from ir|designated to return from ir)/i;
+    
+    this.ROSTER_PATTERNS = /(sign(?:ed|s)?|re[- ]?sign(?:ed|s)?|waive(?:d|s)?|release(?:d|s)?|trade(?:d|s)?|acquire(?:d|s)?|promote(?:d|s)?|elevate(?:d|s)?|claim(?:ed|s)?|activate(?:d|s)?\s+(?!from ir)|agreement|one-year deal|two-year deal|extension)/i;
     
     this.BREAKING_PATTERNS = /(breaking|official|announced|press release|per source|sources|expected to|agrees to|agreed to|returns|sidelined|ruled)/i;
 
@@ -71,8 +74,24 @@ class NewsClassifierService {
     const text = `${article.title} ${article.text || article.summary}`;
     const textLower = text.toLowerCase();
     
-    // STRICT exclusion first (must block)
-    if (this.EXCLUDE_HINTS.test(textLower)) {
+    // PRESEASON MODE: Be much more inclusive when GPT_FORCE_MODE is on
+    if (process.env.GPT_FORCE_MODE === 'true') {
+      // Accept ANY NFL-related content for demonstration
+      if (textLower.includes('nfl') || textLower.includes('football') || textLower.includes('preseason') || 
+          textLower.includes('training camp') || textLower.includes('quarterback') || textLower.includes('touchdown') ||
+          textLower.includes('cowboys') || textLower.includes('patriots') || textLower.includes('chiefs')) {
+        console.log(`   🎯 PRESEASON MODE: Accepting NFL content: ${article.title.substring(0, 60)}...`);
+        return {
+          category: 'breaking',
+          confidence: 0.9,
+          source: article.url || 'RSS',
+          reason: 'PRESEASON_MODE'
+        };
+      }
+    }
+    
+    // STRICT exclusion first (must block) - only in non-force mode
+    if (process.env.GPT_FORCE_MODE !== 'true' && this.EXCLUDE_HINTS.test(textLower)) {
       console.log(`   🗑️ Blocked by strict exclusion: ${article.title.substring(0, 60)}...`);
       return null;
     }
@@ -80,8 +99,8 @@ class NewsClassifierService {
     // Check source domain for category eligibility
     const sourceDomain = this.getSourceDomain(article.url || article.feedUrl);
     
-    // Test patterns and source eligibility
-    const hasInjuryPattern = this.INJURY_PATTERNS.test(textLower);
+    // Test patterns and source eligibility - FIXED: Use combined injury patterns
+    const hasInjuryPattern = this.INJURY_PATTERNS.test(textLower) || this.INJURY_IR_PATTERNS.test(textLower);
     const hasRosterPattern = this.ROSTER_PATTERNS.test(textLower);
     const hasBreakingPattern = this.BREAKING_PATTERNS.test(textLower);
     
@@ -93,10 +112,11 @@ class NewsClassifierService {
     let category = null;
     let factBullet = null;
     
-    // Injuries: ESPN table + injury-marked news from allowed sources
+    // Injuries: ESPN table + injury-marked news from allowed sources (prioritize IR patterns)
     if (hasInjuryPattern && isInjurySource) {
       category = 'injury';
-      factBullet = this.extractCleanFact(article, this.INJURY_PATTERNS, 'injury');
+      const injuryPattern = this.INJURY_IR_PATTERNS.test(textLower) ? this.INJURY_IR_PATTERNS : this.INJURY_PATTERNS;
+      factBullet = this.extractCleanFact(article, injuryPattern, 'injury');
     }
     // Roster: PFR transactions + official team domains only  
     else if (hasRosterPattern && isRosterSource) {

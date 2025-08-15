@@ -147,6 +147,20 @@ class ScheduleState {
   }
 
   /**
+   * Get the last content hash for a specific slot
+   * @param {string} slot - morning|afternoon|evening
+   * @returns {Promise<string|null>} Last hash or null if not found
+   */
+  async getLastHash(slot) {
+    if (!['morning', 'afternoon', 'evening'].includes(slot)) {
+      throw new Error(`Invalid slot: ${slot}. Must be morning, afternoon, or evening`);
+    }
+
+    const hashState = await this.getHashState();
+    return hashState.lastHashes[slot] || null;
+  }
+
+  /**
    * Get pending slots that missed their scheduled time
    * @param {number} now - Current timestamp (default: Date.now())
    * @param {number} graceMs - Grace period in milliseconds for missed runs

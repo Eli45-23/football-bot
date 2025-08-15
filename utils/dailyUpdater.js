@@ -1,7 +1,8 @@
+require('dotenv').config();
 const cron = require('node-cron');
 const moment = require('moment-timezone');
 const crypto = require('crypto');
-const sportsdb = require('../api/sportsdb');
+const sportsdb = require('../api/sportsdb.js');
 const { fetchFallbackNews } = require('../services/rssFallback');
 const { getCache, setCache } = require('../lib/cache');
 const config = require('../config/config');
@@ -9,10 +10,14 @@ const rssService = require('../services/rss');
 const articleCache = require('../utils/articleCache');
 const dedupHashService = require('../utils/dedupHash');
 const aggregateNews = require('../utils/aggregateNews');
-const gptSummarizer = require('../src/services/gptSummarizer.ts');
+const gptSummarizer = require('../src/services/gptSummarizer.js');
 const apiQueue = require('../lib/apiQueue');
 const scheduleState = require('../src/state/scheduleState');
+const contentState = require('../src/state/contentState');
 const offlineQueue = require('../src/posting/offlineQueue');
+const timeUtils = require('../src/utils/time.js');
+const textUtils = require('../src/utils/text');
+const runLogger = require('../src/utils/runLogger');
 
 /**
  * NFL Scheduled Updates Service
@@ -25,15 +30,18 @@ class DailyUpdater {
   constructor(client) {
     this.client = client;
     this.isRunning = false;
+    this.runningSlots = new Set(); // Mutex protection per slot type
     this.lastRuns = {
       morning: null,
       afternoon: null,
       evening: null
     };
+    this.pendingRuns = new Map(); // Debounce protection
     this.batchSize = 3;
     this.batchDelayMs = 45000; // 45 seconds between batches
     this.teamDelayMs = 3000;   // 3 seconds between teams
     this.messageDelayMs = 2000; // 2 seconds between category messages
+    this.debounceMs = parseInt(process.env.UPDATE_DEBOUNCE_MS || '30000'); // 30s debounce
   }
 
   /**
@@ -51,24 +59,55 @@ class DailyUpdater {
   }
 
   /**
-   * Execute a scheduled update with batched processing
+   * Execute a scheduled update with enhanced mutex and debounce protection
    * @param {string} updateType - Type of update (morning/afternoon/evening/test)
    */
   async runScheduledUpdate(updateType = 'scheduled') {
-    if (this.isRunning) {
-      console.log(`⚠️ Update already in progress, skipping ${updateType} update...`);
+    // Enhanced mutex protection per slot type
+    if (this.runningSlots.has(updateType)) {
+      console.log(`⚠️ ${updateType} update already in progress, skipping...`);
       return;
     }
-
+    
+    // Global running check for backward compatibility
+    if (this.isRunning) {
+      console.log(`⚠️ Another update in progress, skipping ${updateType} update...`);
+      return;
+    }
+    
+    // Debounce protection - prevent rapid successive runs
+    const lastPendingTime = this.pendingRuns.get(updateType);
+    const now = Date.now();
+    if (lastPendingTime && (now - lastPendingTime) < this.debounceMs) {
+      const remainingMs = this.debounceMs - (now - lastPendingTime);
+      console.log(`⏱️ ${updateType} update debounced, ${Math.round(remainingMs/1000)}s remaining`);
+      return;
+    }
+    
+    // Set mutex locks
+    this.runningSlots.add(updateType);
     this.isRunning = true;
-    const now = moment().tz(config.timezone);
-    const timeStr = now.format('MMMM D, YYYY - h:mm A z');
+    this.pendingRuns.set(updateType, now);
+    
+    const momentNow = moment().tz(config.timezone);
+    const timeStr = momentNow.format('MMMM D, YYYY - h:mm A z');
+    
+    // Start centralized logging for this run
+    const runId = runLogger.startRun(updateType, timeStr);
+    runLogger.log('info', `Starting ${updateType} NFL update`, { 
+      updateType, 
+      timeStr, 
+      batchSize: this.batchSize,
+      totalTeams: config.nflTeams.length 
+    });
     
     try {
       // Idempotency checks before execution
       const canProceed = await this.checkIdempotency(updateType);
       if (!canProceed) {
+        runLogger.log('warn', 'Idempotency check failed', { updateType });
         console.log(`🔒 Skipping ${updateType} update - idempotency check failed`);
+        runLogger.endRun('skipped', { reason: 'idempotency_check_failed' });
         return;
       }
 
@@ -76,32 +115,107 @@ class DailyUpdater {
       console.log(`📊 Processing ${config.nflTeams.length} teams in batches of ${this.batchSize}...`);
       
       // Collect NFL data using batched processing + RSS
+      runLogger.log('info', 'Starting NFL data collection');
       const nflData = await this.collectNFLDataBatched();
       
-      // Generate content hash for duplicate detection
-      const contentHash = this.generateContentHash(nflData, updateType, timeStr);
+      // Store for final metrics
+      this.lastProcessedCount = nflData.totalProcessed || 0;
+      this.lastSuccessfulCount = nflData.successfulRequests || 0;
+      
+      runLogger.log('info', 'NFL data collection completed', {
+        totalProcessed: this.lastProcessedCount,
+        successfulRequests: this.lastSuccessfulCount,
+        injuryCount: nflData.injuries?.totalCount || 0,
+        rosterCount: nflData.roster?.totalCount || 0,
+        gamesCount: nflData.totalGames || 0,
+        breakingCount: nflData.breaking?.totalCount || 0
+      });
+      
+      // Compute payloadHash BEFORE posting for duplicate detection
+      const payloadHash = dedupHashService.generateContentHash(nflData, updateType, timeStr);
+      
+      // Early return on duplicate - no footer or empty sections posted
+      const isDuplicate = await dedupHashService.isDuplicateEnhanced(payloadHash, updateType);
+      if (isDuplicate) {
+        runLogger.log('warn', 'Duplicate content detected - early return', { payloadHash, updateType });
+        console.log(`🔒 Early return: ${updateType} update content unchanged (hash: ${payloadHash.substring(0, 8)}...)`);
+        runLogger.endRun('skipped', { reason: 'duplicate_content', payloadHash });
+        return; // Early return → no footer or empty sections posted
+      }
+      
+      console.log(`✅ Payload verification passed, proceeding with ${updateType} update (hash: ${payloadHash.substring(0, 8)}...)`);
       
       // Post categorized updates to Discord (5 separate messages)
-      await this.postStaggeredUpdatesToDiscord(nflData, timeStr, updateType);
+      await this.postStaggeredUpdatesToDiscord(nflData, timeStr, updateType, payloadHash);
+      
+      // Save reported content for next delta comparison
+      await contentState.saveReportedContent(nflData, payloadHash);
       
       // Process any deferred API requests with extended delays
       await this.processAPIDeferialsInBackground(updateType);
       
-      // Record successful run in persistent state
-      await scheduleState.setRun(updateType, Date.now());
-      await scheduleState.setLastHash(updateType, contentHash);
+      // Record successful run and payload hash in persistent state (skip for test runs)
+      if (updateType !== 'test') {
+        await scheduleState.setRun(updateType, Date.now());
+        await scheduleState.setLastHash(updateType, payloadHash);
+      }
+      
+      // Also record in in-memory dedup service for short-term detection
+      dedupHashService.recordHash(payloadHash);
       this.lastRuns[updateType] = new Date();
       
       // Log detailed GPT metrics as requested
       const gptMetrics = gptSummarizer.getDetailedMetrics();
+      const gptStatus = gptSummarizer.getStatus();
       console.log(`📊 ${gptMetrics}`);
+      
+      runLogger.log('success', 'Update completed successfully', {
+        updateType,
+        totalProcessed: nflData.totalProcessed,
+        successfulRequests: nflData.successfulRequests,
+        contentHash: 'N/A',
+        gptCalls: gptStatus.callsUsed,
+        gptTokens: gptStatus.tokenUsage?.totalInputTokens + gptStatus.tokenUsage?.totalOutputTokens || 0
+      });
       
       console.log(`🎉 ${updateType} update completed successfully!`);
 
     } catch (error) {
+      runLogger.log('error', 'Update failed with error', {
+        updateType,
+        error: error.message,
+        stack: error.stack?.split('\n')[0]
+      });
+      
       console.error(`❌ Error during ${updateType} update:`, error);
+      
+      // Log error context for debugging
+      console.error(`🔍 Error context:`, {
+        updateType,
+        timeStr,
+        error: error.message,
+        stack: error.stack?.split('\n')[0]
+      });
     } finally {
+      // Enhanced cleanup - release all mutex locks
+      this.runningSlots.delete(updateType);
       this.isRunning = false;
+      
+      // Finalize run logging with metrics
+      const finalStatus = runLogger.currentRunId ? 
+        (runLogger.getRunData()?.status || 'completed') : 'completed';
+      
+      if (runLogger.currentRunId) {
+        const gptStatus = gptSummarizer.getStatus();
+        runLogger.endRun(finalStatus, {
+          totalProcessed: this.lastProcessedCount || 0,
+          successfulRequests: this.lastSuccessfulCount || 0,
+          gptCalls: gptStatus.callsUsed || 0,
+          gptTokens: gptStatus.tokenUsage?.totalInputTokens + gptStatus.tokenUsage?.totalOutputTokens || 0
+        });
+      }
+      
+      console.log(`🔓 Released mutex locks for ${updateType} update`);
     }
   }
 
@@ -114,7 +228,8 @@ class DailyUpdater {
     
     // Check for cached full dataset first (24-hour cache)
     const fullCacheKey = 'nfl:daily:full-dataset';
-    const cachedFullData = await getCache(fullCacheKey);
+    const cachedFullData = null; // TEMP: Force fresh data collection to test schedule fix
+    // const cachedFullData = await getCache(fullCacheKey);
     if (cachedFullData) {
       console.log('💾 Using cached full NFL dataset (24-hour cache)');
       // Still fetch RSS for fresh news even with cached schedule data
@@ -144,9 +259,9 @@ class DailyUpdater {
     // Merge the data
     const mergedData = this.mergeScheduleAndRSS(scheduleData, rssData);
 
-    // Cache the full dataset for 24 hours
-    await setCache(fullCacheKey, mergedData, 1440); // 24 hours = 1440 minutes
-    console.log('💾 Cached full NFL dataset for 24 hours');
+    // TEMPORARILY DISABLED: Cache the full dataset for 24 hours (for testing fixes)
+    // await setCache(fullCacheKey, mergedData, 1440); // 24 hours = 1440 minutes
+    console.log('🚫 CACHE DISABLED - Using fresh data for testing');
 
     return mergedData;
   }
@@ -195,30 +310,93 @@ class DailyUpdater {
     
     const now = moment().tz(config.timezone);
     
-    // Phase 1: Try 7-day window first (±7 days from today)
-    let startDate = now.clone().subtract(7, 'days').startOf('day').toDate();
-    let endDate = now.clone().add(7, 'days').endOf('day').toDate();
+    // Phase 1: Try 14-day forward window (today + 14 days) for better preseason coverage
+    let startDate = now.clone().startOf('day').toDate();
+    let endDate = now.clone().add(14, 'days').endOf('day').toDate();
     
-    console.log(`📋 Phase 1: Trying 7-day window (${startDate.toISOString().split('T')[0]} to ${endDate.toISOString().split('T')[0]})`);
+    console.log(`📋 Phase 1: Trying 14-day forward window (${startDate.toISOString().split('T')[0]} to ${endDate.toISOString().split('T')[0]})`);
     
     let scheduleResult = await sportsdb.getLeagueSchedule(startDate, endDate);
-    let windowUsed = '7 days';
+    let windowUsed = '14 days';
     let windowExpanded = false;
     
-    // Phase 2: Expand to 14 days if fewer than 10 games found
+    // DEBUG: Log the raw API result
+    console.log(`   🔍 CRITICAL DEBUG - Raw API result:`, {
+      totalGames: scheduleResult.totalGames,
+      gamesCount: scheduleResult.games ? scheduleResult.games.length : 'undefined',
+      source: scheduleResult.source
+    });
+    
+    // Phase 2: Expand to 21 days if fewer than 10 games found
     if (scheduleResult.totalGames < config.schedule.minGamesThreshold) {
-      console.log(`📋 Phase 2: Only ${scheduleResult.totalGames} games found, expanding to 14-day window...`);
+      console.log(`📋 Phase 2: Only ${scheduleResult.totalGames} games found, expanding to 21-day window...`);
       
-      startDate = now.clone().subtract(14, 'days').startOf('day').toDate();
-      endDate = now.clone().add(14, 'days').endOf('day').toDate();
+      // Keep start date as today, expand end date further to find more future games
+      startDate = now.clone().startOf('day').toDate();
+      endDate = now.clone().add(21, 'days').endOf('day').toDate();
       
       scheduleResult = await sportsdb.getLeagueSchedule(startDate, endDate);
-      windowUsed = '14 days';
+      windowUsed = '21 days';
       windowExpanded = true;
+      
+      // DEBUG: Log the expanded API result
+      console.log(`   🔍 CRITICAL DEBUG - Expanded API result:`, {
+        totalGames: scheduleResult.totalGames,
+        gamesCount: scheduleResult.games ? scheduleResult.games.length : 'undefined',
+        source: scheduleResult.source
+      });
     }
     
-    // Sort games by date
-    const sortedGames = scheduleResult.games.sort((a, b) => {
+    // RSS Schedule Supplement: Add missing preseason games
+    try {
+      const nflScheduleRSS = require('../services/nflScheduleRSS');
+      scheduleResult.games = await nflScheduleRSS.supplementSchedule(
+        scheduleResult.games || [], 
+        startDate, 
+        endDate
+      );
+      scheduleResult.totalGames = scheduleResult.games.length;
+      console.log(`📡 After RSS supplement: ${scheduleResult.totalGames} total games`);
+    } catch (error) {
+      console.log(`⚠️ RSS schedule supplement failed: ${error.message}`);
+    }
+    
+    // Enhanced schedule processing with future-only filtering and date grouping
+    // Default to true for better preseason game handling
+    const groupByDate = process.env.GROUP_GAMES_BY_DATE !== 'false';
+    
+    console.log(`   🔍 DEBUG: GROUP_GAMES_BY_DATE=${process.env.GROUP_GAMES_BY_DATE}, groupByDate=${groupByDate}`);
+    console.log(`   🔍 DEBUG: scheduleResult.games.length=${scheduleResult.games ? scheduleResult.games.length : 'undefined'}`);
+    
+    if (groupByDate && scheduleResult.games && scheduleResult.games.length > 0) {
+      console.log('📅 Processing schedule with date grouping...');
+      
+      // Group games by date for enhanced presentation
+      const groupedData = sportsdb.groupGamesByDate(scheduleResult.games);
+      const formattedGames = sportsdb.formatGroupedGames(groupedData);
+      
+      console.log(`✅ Enhanced schedule: ${groupedData.totalGames} games grouped by ${groupedData.dateGroupOrder.length} dates`);
+      
+      return {
+        scheduledGames: formattedGames,
+        totalGames: groupedData.totalGames,
+        source: scheduleResult.source,
+        apiCalls: scheduleResult.apiCalls,
+        windowUsed,
+        windowExpanded,
+        dateGrouping: true,
+        dateGroups: groupedData.dateGroupOrder
+      };
+    }
+    
+    // Legacy format: Sort games by date for simple list
+    console.log(`   🔍 DEBUG scheduleResult.games:`, scheduleResult.games ? scheduleResult.games.length : 'undefined');
+    if (scheduleResult.games) {
+      console.log(`   🔍 DEBUG first game:`, scheduleResult.games[0]);
+    }
+    
+    const legacyGames = (scheduleResult.games || []).map(game => game.formatted || game);
+    const sortedGames = legacyGames.sort((a, b) => {
       try {
         const dateA = this.parseGameDateFromString(a);
         const dateB = this.parseGameDateFromString(b);
@@ -228,14 +406,23 @@ class DailyUpdater {
       }
     });
     
-    console.log(`✅ League schedule collected:`);
+    console.log(`✅ League schedule collected (legacy format):`);
     console.log(`   🗓️ Window: ${windowUsed} (${windowExpanded ? 'expanded' : 'initial'})`); 
     console.log(`   🏈 Games found: ${scheduleResult.totalGames}`);
     console.log(`   📡 API calls: ${scheduleResult.apiCalls}`);
     console.log(`   📊 Source: ${scheduleResult.source}`);
+    console.log(`   🔍 DEBUG legacyGames length: ${legacyGames.length}`);
+    console.log(`   🔍 DEBUG sortedGames length: ${sortedGames.length}`);
     
+    console.log(`   🔍 FINAL RETURN DEBUG:`, {
+      sortedGames: sortedGames.length,
+      scheduleResultTotalGames: scheduleResult.totalGames,
+      scheduleResultGamesArray: scheduleResult.games ? scheduleResult.games.length : 'undefined'
+    });
+
     return {
       scheduledGames: sortedGames,
+      totalGames: scheduleResult.totalGames,
       totalProcessed: 1, // League API call instead of 32 team calls
       successfulRequests: 1,
       unavailableTeams: [],
@@ -244,7 +431,8 @@ class DailyUpdater {
       apiCallsUsed: scheduleResult.apiCalls,
       windowUsed,
       windowExpanded,
-      dateRange: scheduleResult.dateRange
+      dateRange: scheduleResult.dateRange,
+      dateGrouping: false
     };
   }
   
@@ -350,6 +538,14 @@ class DailyUpdater {
   mergeScheduleAndRSS(scheduleData, rssData) {
     console.log('🔄 Merging league schedule and RSS data...');
     
+    // DEBUG: Log schedule data structure to diagnose 0 games issue
+    console.log('   🔍 DEBUG scheduleData structure:', {
+      scheduledGames: scheduleData.scheduledGames ? scheduleData.scheduledGames.length : 'undefined',
+      totalGames: scheduleData.totalGames,
+      dataSource: scheduleData.dataSource,
+      // Note: scheduleData has 'scheduledGames' not 'games' - games are in the API response only
+    });
+    
     const merged = {
       // Copy league schedule metadata
       totalProcessed: scheduleData.totalProcessed,
@@ -389,7 +585,7 @@ class DailyUpdater {
     let sourceLine = '🗂 Sources: ';
     
     // Add schedule source
-    if (scheduleData.dataSource.includes('League')) {
+    if (scheduleData.dataSource && scheduleData.dataSource.includes('League')) {
       sourceLine += 'TheSportsDB League API';
     } else if (scheduleData.fallbackUsed) {
       sourceLine += 'TheSportsDB (Fallback)';
@@ -442,12 +638,36 @@ class DailyUpdater {
 
   /**
    * Format schedule category data - shows ALL games, no cap
-   * @param {Array} scheduleItems - Schedule items
+   * @param {Array} scheduleItems - Schedule items (strings or objects with .formatted)
    * @returns {Object} Formatted schedule category
    */
   formatScheduleCategory(scheduleItems) {
+    if (!scheduleItems || scheduleItems.length === 0) {
+      console.log('   ⚠️ formatScheduleCategory: No schedule items provided');
+      return {
+        items: [],
+        totalCount: 0,
+        truncatedCount: 0,
+        source: 'TheSportsDB'
+      };
+    }
+    
+    console.log(`   📊 formatScheduleCategory: Processing ${scheduleItems.length} schedule items`);
+    
+    // Extract formatted strings from objects or use strings directly
+    const gameStrings = scheduleItems.map(item => {
+      if (typeof item === 'string') {
+        return item;
+      } else if (item && item.formatted) {
+        return item.formatted;
+      } else {
+        console.log(`   ⚠️ Unexpected schedule item format:`, item);
+        return JSON.stringify(item);
+      }
+    });
+    
     // Sort schedule items by date if possible
-    const sortedItems = scheduleItems.sort((a, b) => {
+    const sortedItems = gameStrings.sort((a, b) => {
       try {
         const dateA = new Date(a.match(/\w+ \d+, \d+:\d+ \w+/)?.[0] || '1970-01-01');
         const dateB = new Date(b.match(/\w+ \d+, \d+:\d+ \w+/)?.[0] || '1970-01-01');
@@ -456,6 +676,8 @@ class DailyUpdater {
         return 0;
       }
     });
+    
+    console.log(`   ✅ formatScheduleCategory: Formatted ${sortedItems.length} games`);
     
     // Return ALL items, no truncation
     return {
@@ -599,16 +821,26 @@ class DailyUpdater {
     const totalItems = items.length;
     
     if (totalItems === 0) {
-      // Post empty category section
-      const emptyEmbed = this.createNewSectionEmbed(categoryTitle, categoryData);
-      await this.queuedSend(channel, { embeds: [emptyEmbed] }, `empty ${categoryTitle.toLowerCase()}`);
-      console.log(`   ${categoryTitle.split(' ')[0]} Posted empty ${categoryTitle.toLowerCase()}`);
-      return;
+      // Empty category - check policy
+      const emptyMode = process.env.EMPTY_SECTION_MODE || 'message';
+      
+      if (emptyMode === 'skip') {
+        console.log(`   ⏭️ ${categoryTitle.split(' ')[0]} Skipping empty ${categoryTitle.toLowerCase()} (policy: skip)`);
+        return;
+      } else {
+        // Default 'message' mode - post empty message
+        console.log(`   📝 ${categoryTitle.split(' ')[0]} Posting empty ${categoryTitle.toLowerCase()} (policy: ${emptyMode})`);
+        const emptyEmbed = this.createEnhancedSectionEmbed(categoryTitle, categoryData, 1, 1);
+        if (emptyEmbed) { // emptyEmbed could be null if skip policy is applied in createEnhancedSectionEmbed
+          await this.queuedSend(channel, { embeds: [emptyEmbed] }, `empty ${categoryTitle.toLowerCase()}`);
+        }
+        return;
+      }
     }
     
     if (totalItems <= itemsPerMessage) {
       // Single message - no chunking needed
-      const singleEmbed = this.createNewSectionEmbed(categoryTitle, categoryData);
+      const singleEmbed = this.createEnhancedSectionEmbed(categoryTitle, categoryData, 1, 1);
       await this.queuedSend(channel, { embeds: [singleEmbed] }, `${categoryTitle.toLowerCase()} (single message)`);
       console.log(`   ${categoryTitle.split(' ')[0]} Posted ${categoryTitle.toLowerCase()} (${totalItems} items in 1 message)`);
     } else {
@@ -619,14 +851,12 @@ class DailyUpdater {
         const chunk = chunks[i];
         const chunkData = {
           items: chunk,
-          totalCount: chunk.length,
+          totalCount: categoryData.totalCount || totalItems, // Use total count from original data
           truncatedCount: 0, // No truncation with pagination
           source: categoryData.source
         };
         
-        // Add page number to title: "🏥 Injuries (1/3)"
-        const pagedTitle = `${categoryTitle} (${i + 1}/${chunks.length})`;
-        const chunkEmbed = this.createNewSectionEmbed(pagedTitle, chunkData);
+        const chunkEmbed = this.createEnhancedSectionEmbed(categoryTitle, chunkData, i + 1, chunks.length);
         await this.queuedSend(channel, { embeds: [chunkEmbed] }, `${categoryTitle.toLowerCase()} chunk ${i + 1}/${chunks.length}`);
         
         // Small delay between chunks
@@ -645,16 +875,9 @@ class DailyUpdater {
    * @param {string} timeStr - Formatted time string
    * @param {string} updateType - Type of update for logging
    */
-  async postStaggeredUpdatesToDiscord(nflData, timeStr, updateType) {
+  async postStaggeredUpdatesToDiscord(nflData, timeStr, updateType, payloadHash) {
     try {
-      // Check for duplicate payload first
-      const dedupResult = dedupHashService.checkAndRecord(nflData);
-      if (dedupResult.isDuplicate) {
-        console.log(`🚫 Skipping duplicate post (hash: ${dedupResult.hash}, window: ${dedupResult.windowMs/1000}s)`);
-        return;
-      }
-      
-      console.log(`✅ Payload hash verified: ${dedupResult.hash} (posting allowed)`);
+      console.log(`📤 Posting ${updateType} update to Discord (hash: ${payloadHash.substring(0, 8)}...)`);
       
       if (!config.discord.nflUpdatesChannelId) {
         console.log('⚠️ NFL_UPDATES_CHANNEL_ID not set, logging to console:');
@@ -716,11 +939,15 @@ class DailyUpdater {
   createHeaderEmbed(timeStr, updateType, nflData) {
     const { EmbedBuilder } = require('discord.js');
     
-    const runLabel = updateType.charAt(0).toUpperCase() + updateType.slice(1);
-    const title = `📢 NFL ${runLabel} Update – ${timeStr.split(' – ')[0]} – ${timeStr.split(' – ')[1]}`;
+    // Format title as: "NFL {Morning|Afternoon|Evening} Update – {MMM d}, {h:mm A} EDT"
+    const updateTypeLabel = updateType.charAt(0).toUpperCase() + updateType.slice(1);
+    const now = timeUtils.now();
+    const dateStr = now.toFormat('MMM d');
+    const formattedTime = now.toFormat('h:mm a ZZZZ');
+    const title = `📢 NFL ${updateTypeLabel} Update – ${dateStr}, ${formattedTime}`;
     
-    // Build comprehensive description with GPT and schedule info
-    let description = this.buildHeaderDescription(nflData, updateType);
+    // Build comprehensive description with league mode support
+    let description = this.buildEnhancedHeaderDescription(nflData, updateType);
     
     return new EmbedBuilder()
       .setTitle(title)
@@ -730,82 +957,159 @@ class DailyUpdater {
   }
   
   /**
-   * Build comprehensive header description with GPT status and schedule info
+   * Build enhanced header description with league mode support
    * @param {Object} nflData - NFL data with stats
    * @param {string} updateType - Update type for context
    * @returns {string} Formatted description
    */
-  buildHeaderDescription(nflData, updateType) {
+  buildEnhancedHeaderDescription(nflData, updateType) {
     const descriptionParts = [];
     
-    // Processing stats
-    if (nflData.totalProcessed) {
-      let processingStat = `Processing ${nflData.totalProcessed} teams • ${nflData.successfulRequests} successful`;
-      if (nflData.unavailableTeams && nflData.unavailableTeams.length > 0) {
-        processingStat += ` • ${nflData.unavailableTeams.length} unavailable`;
-      }
-      descriptionParts.push(processingStat);
+    // League mode header format instead of team processing stats
+    if (nflData.apiCallsUsed && nflData.windowUsed) {
+      const windowDays = this.extractWindowDays(nflData.windowUsed);
+      const scheduleInfo = `📅 Schedule: League mode • Window: ${windowDays} days • API calls: ${nflData.apiCallsUsed}`;
+      descriptionParts.push(scheduleInfo);
+      descriptionParts.push('Monitored teams: 32');
+    } else if (nflData.windowUsed) {
+      const windowDays = this.extractWindowDays(nflData.windowUsed);
+      const scheduleInfo = `📅 Schedule: League mode • Window: ${windowDays} days`;
+      descriptionParts.push(scheduleInfo);
+      descriptionParts.push('Monitored teams: 32');
     }
     
-    // GPT Status - Make GPT usage OBVIOUS as requested
+    // Enhanced content counters with proper formatting
+    const counters = this.buildContentCounters(nflData);
+    if (counters) {
+      descriptionParts.push(counters);
+    }
+    
+    // Enhanced GPT Status - Make GPT usage OBVIOUS as requested
     const gptStatus = gptSummarizer.getStatus();
     let gptLine = '';
     if (gptStatus.enabled) {
-      gptLine = `🤖 AI polish: **ON** (${gptStatus.model}, calls used: ${gptStatus.callsUsed})`;
+      const tokenInfo = gptStatus.tokenUsage ? 
+        ` • ${gptStatus.tokenUsage.totalInputTokens}→${gptStatus.tokenUsage.totalOutputTokens} tokens` : '';
+      gptLine = `🤖 AI polish: **ON** (${gptStatus.model}, ${gptStatus.callsUsed}/${gptStatus.callsLimit} calls${tokenInfo})`;
     } else {
-      gptLine = '🤖 AI polish: **OFF**';
+      gptLine = '🤖 AI polish: **OFF** (rule-based categorization)';
     }
     descriptionParts.push(gptLine);
     
-    // Schedule Window Info
+    // Enhanced schedule window info with lookback details
+    const lookbackHours = timeUtils.getLookbackHours(updateType);
     if (nflData.windowUsed) {
       const windowText = nflData.windowExpanded 
-        ? `📅 Schedule: ${nflData.windowUsed} (expanded)`
-        : `📅 Schedule: ${nflData.windowUsed}`;
+        ? `📅 Schedule: ${nflData.windowUsed} (expanded) • ${lookbackHours}h lookback`
+        : `📅 Schedule: ${nflData.windowUsed} • ${lookbackHours}h lookback`;
       descriptionParts.push(windowText);
+    } else {
+      descriptionParts.push(`📅 Lookback: ${lookbackHours}h`);
     }
     
-    // API Efficiency Stats (if available)
-    if (nflData.apiCallsUsed && nflData.apiCallsUsed <= 5) {
-      descriptionParts.push(`📡 API calls: ${nflData.apiCallsUsed} (League API)`);
+    // Enhanced API efficiency stats
+    if (nflData.apiCallsUsed) {
+      const callText = textUtils.pluralize(nflData.apiCallsUsed, 'call');
+      const efficiency = nflData.apiCallsUsed <= 5 ? ' (League API)' : ' (Team APIs)';
+      descriptionParts.push(`📡 API ${callText}: ${nflData.apiCallsUsed}${efficiency}`);
     }
     
     return descriptionParts.length > 0 
       ? descriptionParts.join(' • ')
       : 'Gathering latest NFL updates...';
   }
+  
+  /**
+   * Build content counters for header description
+   * @param {Object} nflData - NFL data with content stats
+   * @returns {string|null} Formatted counters or null
+   */
+  buildContentCounters(nflData) {
+    const counters = [];
+    
+    if (nflData.injuries && nflData.injuries.totalCount > 0) {
+      counters.push(`${nflData.injuries.totalCount} ${textUtils.pluralize(nflData.injuries.totalCount, 'injury', 'injuries')}`);
+    }
+    
+    if (nflData.roster && nflData.roster.totalCount > 0) {
+      counters.push(`${nflData.roster.totalCount} ${textUtils.pluralize(nflData.roster.totalCount, 'move')}`);
+    }
+    
+    if (nflData.breaking && nflData.breaking.totalCount > 0) {
+      counters.push(`${nflData.breaking.totalCount} breaking`);
+    }
+    
+    if (nflData.games && nflData.games.totalGames > 0) {
+      counters.push(`${nflData.games.totalGames} ${textUtils.pluralize(nflData.games.totalGames, 'game')}`);
+    }
+    
+    return counters.length > 0 ? `📊 Content: ${counters.join(' • ')}` : null;
+  }
 
   /**
-   * Create section embed for a specific category with new format
+   * Create section embed for a specific category with enhanced formatting
    * @param {string} title - Section title
    * @param {Object} categoryData - Category data with items, counts, etc.
+   * @param {number} messageIndex - Current message index for pagination
+   * @param {number} totalMessages - Total messages for this category
    * @returns {Object} Discord embed
    */
-  createNewSectionEmbed(title, categoryData) {
+  createEnhancedSectionEmbed(title, categoryData, messageIndex = 1, totalMessages = 1) {
     const { EmbedBuilder } = require('discord.js');
+    
+    // Enhanced title with counters and pagination
+    let enhancedTitle = title;
+    
+    // Add counters to title
+    if (categoryData.totalCount > 0) {
+      const counter = textUtils.generateCounter(
+        categoryData.items ? categoryData.items.length : 0, 
+        categoryData.totalCount,
+        this.getCategoryItemType(title)
+      );
+      enhancedTitle += ` ${counter}`;
+    }
+    
+    // Add pagination info if multiple messages
+    if (totalMessages > 1) {
+      enhancedTitle += ` [${messageIndex}/${totalMessages}]`;
+    }
     
     let content = '';
     
     if (categoryData.items && categoryData.items.length > 0) {
-      content = categoryData.items.map(item => `• ${item}`).join('\n');
-      
-      // REMOVED: Truncation logic - pagination system handles large datasets
-      // No more "(+N more)" messages needed
+      // Use enhanced bullet formatting
+      content = categoryData.items.map(item => textUtils.createBullet(item)).join('\n');
     } else {
-      // Default messages for empty sections
-      const defaultMessages = {
-        '🏥 Injuries': '• No updates',
-        '🔁 Roster Changes': '• No updates',
-        '📅 Scheduled Games': '• No upcoming games',
-        '📰 Breaking News': '• No updates'
-      };
-      content = defaultMessages[title] || '• No updates';
+      // Empty-section policy implementation as per requirements
+      const emptyMode = process.env.EMPTY_SECTION_MODE || 'message';
+      
+      if (emptyMode === 'skip') {
+        return null; // Do not post the section - skip entirely
+      }
+      
+      // Mode is 'message' - post one line with lookback hours
+      const lookbackHours = this.getLookbackHoursForSection(title);
+      content = textUtils.createBullet(`No updates in the last ${lookbackHours}h`);
     }
 
     return new EmbedBuilder()
-      .setTitle(title)
+      .setTitle(enhancedTitle)
       .setDescription(content.substring(0, 4096)) // Discord description limit
       .setColor(0x013369);
+  }
+  
+  /**
+   * Get the item type for counter generation
+   * @param {string} title - Section title
+   * @returns {string} Item type for pluralization
+   */
+  getCategoryItemType(title) {
+    if (title.includes('Injuries')) return 'injuries';
+    if (title.includes('Roster')) return 'moves';
+    if (title.includes('Games')) return 'games';
+    if (title.includes('Breaking')) return 'updates';
+    return 'items';
   }
 
   // REMOVED: postScheduledGamesWithChunking - replaced by generic postCategoryWithChunking method
@@ -1109,6 +1413,135 @@ class DailyUpdater {
     
     return nextRuns;
   }
+  
+  /**
+   * Get comprehensive status including run logging
+   * @returns {Object} Status information
+   */
+  getEnhancedStatus() {
+    const runnerStatus = {
+      isRunning: this.isRunning,
+      runningSlots: Array.from(this.runningSlots),
+      lastRuns: this.lastRuns,
+      pendingRuns: Object.fromEntries(this.pendingRuns),
+      batchSize: this.batchSize,
+      debounceMs: this.debounceMs,
+      lastProcessedCount: this.lastProcessedCount || 0,
+      lastSuccessfulCount: this.lastSuccessfulCount || 0
+    };
+    
+    const loggingStatus = runLogger.getDiagnostics();
+    const gptStatus = gptSummarizer.getStatus();
+    
+    return {
+      runner: runnerStatus,
+      logging: loggingStatus,
+      gpt: gptStatus,
+      recentRuns: runLogger.getRecentRuns(5)
+    };
+  }
+  
+  /**
+   * Extract number of days from window string (e.g., "7 days" -> 7)
+   * @param {string} windowStr - Window string like "7 days" or "14 days"
+   * @returns {number} Number of days
+   */
+  extractWindowDays(windowStr) {
+    if (!windowStr) return 7; // Default
+    
+    const match = windowStr.match(/(\d+)/);
+    return match ? parseInt(match[1]) : 7;
+  }
+  
+  /**
+   * Get lookback hours for empty section messages
+   * @param {string} title - Section title (e.g., "🏥 Injuries")
+   * @returns {number} Lookback hours for this section
+   */
+  getLookbackHoursForSection(title) {
+    // Default to morning lookback hours
+    let defaultLookback = parseInt(process.env.LOOKBACK_HOURS_MORNING || '24');
+    
+    // For breaking news, use evening lookback if available
+    if (title.includes('Breaking')) {
+      defaultLookback = parseInt(process.env.BREAKING_LOOKBACK_EVENING || '36');
+    }
+    
+    // Try to get current update type from context for more accurate lookback
+    try {
+      // This is a fallback approach - use time-based detection
+      const currentTime = timeUtils.now();
+      const currentHour = currentTime.hour;
+      
+      if (currentHour >= 7 && currentHour < 13) {
+        // Morning slot (8 AM)
+        return parseInt(process.env.LOOKBACK_HOURS_MORNING || '24');
+      } else if (currentHour >= 13 && currentHour < 19) {
+        // Afternoon slot (2 PM)  
+        return parseInt(process.env.LOOKBACK_HOURS_AFTERNOON || '12');
+      } else {
+        // Evening slot (8 PM)
+        if (title.includes('Breaking')) {
+          return parseInt(process.env.BREAKING_LOOKBACK_EVENING || '36');
+        } else {
+          return parseInt(process.env.LOOKBACK_HOURS_EVENING || '24');
+        }
+      }
+    } catch (error) {
+      return defaultLookback;
+    }
+  }
 }
 
 module.exports = DailyUpdater;
+
+// Command-line execution
+if (require.main === module) {
+  const { Client, GatewayIntentBits } = require('discord.js');
+  
+  const runType = process.argv[2] || 'manual';
+  console.log(`\n🚀 Starting ${runType} update run...`);
+  
+  // Create Discord client
+  const client = new Client({
+    intents: [
+      GatewayIntentBits.Guilds,
+      GatewayIntentBits.GuildMessages
+    ]
+  });
+  
+  // Initialize updater
+  const updater = new DailyUpdater(client);
+  
+  // Login and run update
+  client.once('ready', async () => {
+    console.log(`✅ Discord bot logged in as ${client.user.tag}`);
+    
+    try {
+      // Run the update
+      await updater.runScheduledUpdate(runType);
+      console.log(`✅ ${runType} update completed successfully`);
+      
+      // Give time for messages to send
+      setTimeout(() => {
+        client.destroy();
+        process.exit(0);
+      }, 5000);
+    } catch (error) {
+      console.error(`❌ Error running ${runType} update:`, error);
+      client.destroy();
+      process.exit(1);
+    }
+  });
+  
+  // Handle login errors
+  client.on('error', (error) => {
+    console.error('❌ Discord client error:', error);
+  });
+  
+  // Login to Discord
+  client.login(process.env.DISCORD_TOKEN).catch(error => {
+    console.error('❌ Failed to login to Discord:', error);
+    process.exit(1);
+  });
+}

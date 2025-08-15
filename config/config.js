@@ -34,7 +34,7 @@ const config = {
       lookupFormerTeams: '/lookupformerteams.php'
     },
     nflLeagueId: '4391', // NFL League ID for TheSportsDB
-    currentSeason: '2025' // Current NFL season
+    currentSeason: '2025' // Current NFL season (Aug 2025 preseason games)
   },
 
   // OpenAI Configuration
