@@ -170,6 +170,21 @@ class ESPNInjuriesService {
       teamAbbr = this.extractTeamFromCell(cells[2]);
     }
 
+    // Try to extract team from injury notes (mentions like "Cardinals", "Patriots")
+    if (!teamAbbr && cells.length >= 5) {
+      const noteText = cells[4].textContent || '';
+      teamAbbr = this.extractTeamFromNotes(noteText);
+    }
+
+    // Try to extract team from player URL
+    if (!teamAbbr) {
+      const playerLink = playerCell.querySelector('a');
+      if (playerLink) {
+        const href = playerLink.getAttribute('href') || '';
+        teamAbbr = this.extractTeamFromPlayerURL(href, player);
+      }
+    }
+
     // Fallback: look for team in the entire row text
     if (!teamAbbr) {
       const rowText = row.textContent || '';
@@ -428,9 +443,16 @@ class ESPNInjuriesService {
     
     const text = cell.textContent?.trim() || '';
     
-    // Look for team abbreviations in common formats
+    // NFL positions to exclude from team matching
+    const nflPositions = [
+      'QB', 'RB', 'FB', 'WR', 'TE', 'OT', 'OG', 'C', 'G', 'OL',
+      'DE', 'DT', 'NT', 'OLB', 'ILB', 'MLB', 'LB', 'CB', 'FS', 'SS', 'S',
+      'K', 'P', 'LS', 'KR', 'PR', 'ST'
+    ];
+    
+    // Look for team abbreviations, but exclude NFL positions
     const teamMatch = text.match(/\b([A-Z]{2,4})\b/);
-    if (teamMatch) {
+    if (teamMatch && !nflPositions.includes(teamMatch[1])) {
       return teamMatch[1];
     }
     
@@ -442,7 +464,12 @@ class ESPNInjuriesService {
       const teamFromAlt = altText.match(/\b([A-Z]{2,4})\b/)?.[1];
       const teamFromSrc = srcText.match(/\/([A-Z]{2,4})[\/.]/)?.[1];
       
-      return teamFromAlt || teamFromSrc || null;
+      if (teamFromAlt && !nflPositions.includes(teamFromAlt)) {
+        return teamFromAlt;
+      }
+      if (teamFromSrc && !nflPositions.includes(teamFromSrc)) {
+        return teamFromSrc;
+      }
     }
     
     return null;
@@ -470,6 +497,50 @@ class ESPNInjuriesService {
       }
     }
     
+    return null;
+  }
+
+  /**
+   * Extract team from injury notes by looking for team name mentions
+   */
+  extractTeamFromNotes(noteText) {
+    if (!noteText) return null;
+    
+    // Map team names to abbreviations
+    const teamNameMap = {
+      'cardinals': 'ARI', 'falcons': 'ATL', 'ravens': 'BAL', 'bills': 'BUF',
+      'panthers': 'CAR', 'bears': 'CHI', 'bengals': 'CIN', 'browns': 'CLE',
+      'cowboys': 'DAL', 'broncos': 'DEN', 'lions': 'DET', 'packers': 'GB',
+      'texans': 'HOU', 'colts': 'IND', 'jaguars': 'JAX', 'chiefs': 'KC',
+      'raiders': 'LV', 'chargers': 'LAC', 'rams': 'LAR', 'dolphins': 'MIA',
+      'vikings': 'MIN', 'patriots': 'NE', 'saints': 'NO', 'giants': 'NYG',
+      'jets': 'NYJ', 'eagles': 'PHI', 'steelers': 'PIT', '49ers': 'SF',
+      'seahawks': 'SEA', 'buccaneers': 'TB', 'titans': 'TEN', 'commanders': 'WAS'
+    };
+    
+    const lowerText = noteText.toLowerCase();
+    
+    // Look for team name mentions
+    for (const [teamName, abbr] of Object.entries(teamNameMap)) {
+      if (lowerText.includes(teamName)) {
+        return abbr;
+      }
+    }
+    
+    // Also check for abbreviations that might be in the notes
+    return this.extractTeamFromText(noteText);
+  }
+
+  /**
+   * Extract team from player profile URL or use basic player-to-team mapping
+   * Since ESPN URLs don't contain team info, we'll create a basic mapping approach
+   */
+  extractTeamFromPlayerURL(playerURL, playerName) {
+    // For now, we can't reliably extract team from ESPN player URLs
+    // They follow pattern: /nfl/player/_/id/PLAYERID/player-name
+    // This would require an additional API call to get team info
+    
+    // Return null for now - we'll rely on other extraction methods
     return null;
   }
 
