@@ -46,6 +46,14 @@ class NFLDiscordBot {
       console.log(`🎯 Serving ${this.client.guilds.cache.size} server(s)`);
       console.log('📋 Slash commands disabled - scheduled updates only');
       
+      // Update global status for health checks
+      if (global.discordBotStatus) {
+        global.discordBotStatus.connected = true;
+        global.discordBotStatus.client = this.client.user.tag;
+        global.discordBotStatus.lastError = null;
+        console.log('✅ Health check status updated - Discord connected');
+      }
+      
       // Set bot activity status
       this.client.user.setActivity('NFL Scheduled Updates Only', { 
         type: ActivityType.Watching 
@@ -194,13 +202,21 @@ class NFLDiscordBot {
         // Pre-connection validation
         await this.validateConnectivity();
         
-        // Validate Discord token format
-        if (!config.discord.token || !config.discord.token.startsWith('MT')) {
-          throw new Error('Invalid Discord token format - token should start with MT');
+        // Validate Discord token exists
+        if (!config.discord.token) {
+          throw new Error('Discord token is missing - please set DISCORD_TOKEN environment variable');
         }
         
-        console.log('🔐 Discord token format validated');
+        // Log token info (safely)
+        const tokenPrefix = config.discord.token.substring(0, 10);
+        console.log(`🔐 Discord token found (starts with: ${tokenPrefix}...)`)
+        
         console.log('🔄 Attempting to connect to Discord...');
+        
+        // Update connection attempt counter
+        if (global.discordBotStatus) {
+          global.discordBotStatus.connectionAttempts++;
+        }
         
         // Attempt to login
         await this.client.login(config.discord.token);
@@ -208,7 +224,24 @@ class NFLDiscordBot {
         
       } catch (error) {
         retryCount++;
-        console.error(`❌ Bot startup attempt ${retryCount}/${maxRetries} failed:`, error.message);
+        console.error(`❌ Bot startup attempt ${retryCount}/${maxRetries} failed:`);
+        console.error('Error details:', error);
+        
+        // Update global status with error
+        if (global.discordBotStatus) {
+          global.discordBotStatus.lastError = error.message || error.code || 'Unknown error';
+        }
+        
+        // Log specific error types
+        if (error.code === 'TOKEN_INVALID') {
+          console.error('🔑 Invalid Discord token - please check your DISCORD_TOKEN environment variable');
+        } else if (error.code === 'DISALLOWED_INTENTS') {
+          console.error('⚠️ Bot intents configuration issue - check Discord application settings');
+        } else if (error.message?.includes('ENOTFOUND') || error.message?.includes('ETIMEDOUT')) {
+          console.error('🌐 Network connectivity issue - cannot reach Discord servers');
+        } else if (error.message?.includes('401')) {
+          console.error('🔑 Authentication failed - token may be invalid or expired');
+        }
         
         if (retryCount < maxRetries) {
           const delay = Math.min(5000 * retryCount, 15000); // Exponential backoff, max 15s
@@ -217,10 +250,10 @@ class NFLDiscordBot {
         } else {
           console.error('❌ All startup attempts failed');
           console.error('💡 Possible solutions:');
-          console.error('   - Check Discord token validity');
-          console.error('   - Verify internet connection');
+          console.error('   - Check Discord token validity in Render environment variables');
+          console.error('   - Verify the token matches your Discord application');
           console.error('   - Check if Discord API is experiencing outages');
-          console.error('   - Verify firewall/proxy settings');
+          console.error('   - Ensure bot has proper intents enabled in Discord Developer Portal');
           process.exit(1);
         }
       }
