@@ -1,9 +1,6 @@
 const express = require('express');
 const path = require('path');
 
-// Import the main bot
-const NFLDiscordBot = require('./index.js');
-
 // Create Express app for health checks (Render requirement)
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -33,10 +30,9 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`🌐 Health check server running on port ${PORT} - Ready for Render!`);
 });
 
-// Start the Discord bot
+// Start the Discord bot by requiring index.js (which auto-starts)
 console.log('🤖 Starting NFL Discord Bot...');
-const bot = new NFLDiscordBot();
-bot.start();
+require('./index.js');
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
