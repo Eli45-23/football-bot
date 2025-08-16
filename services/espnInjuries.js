@@ -165,6 +165,17 @@ class ESPNInjuriesService {
       }
     }
 
+    // Third cell often contains team info - try it too
+    if (!teamAbbr && cells.length >= 3) {
+      teamAbbr = this.extractTeamFromCell(cells[2]);
+    }
+
+    // Fallback: look for team in the entire row text
+    if (!teamAbbr) {
+      const rowText = row.textContent || '';
+      teamAbbr = this.extractTeamFromText(rowText);
+    }
+
     // Skip game date (third cell) - this is NOT the update date!
     // Status (fourth cell)
     if (cells.length >= 4) {
@@ -250,22 +261,36 @@ class ESPNInjuriesService {
   }
 
   /**
-   * Format bullets with exact user-specified format
-   * bullet: `${player} (${team}) — ${status}${note ? " ("+note+")" : ""} · Updated ${updated} (ESPN)`
+   * Format bullets with enhanced format including position, team, and return timeline
+   * Format: 🆕 NEW: Player (TEAM, POS) — Status (detailed note with return info) · Updated Date (ESPN)
    */
   formatBulletsExact(injuries) {
     return injuries.map(injury => {
       // Sanitize and normalize fields as specified
       const player = this.titleCaseName(this.sanitizeText(injury.player));
       const team = injury.teamAbbr.toUpperCase();
+      const position = injury.position ? injury.position.toUpperCase() : null;
       const status = this.sentenceCase(this.sanitizeText(injury.status));
-      const noteText = injury.note ? ` (${this.sanitizeText(injury.note)})` : '';
       
       // Skip completely malformed entries (likely HTML artifacts)
       if (!player || player.length < 2 || /^(injury|reports?|table|header)$/i.test(player)) {
         console.log(`   🗑️ Skipping malformed injury entry: "${injury.player}"`);
         return null;
       }
+      
+      // Determine if this is a "NEW" injury (within 6 hours)
+      const isNew = this.isNewInjury(injury);
+      const newIndicator = isNew ? '🆕 NEW: ' : '';
+      
+      // Build team and position info
+      let teamPositionInfo = `(${team}`;
+      if (position) {
+        teamPositionInfo += `, ${position}`;
+      }
+      teamPositionInfo += ')';
+      
+      // Enhanced note with return timeline
+      const enhancedNote = this.buildEnhancedNote(injury.note);
       
       // Format updated date
       let updated = 'Recently';
@@ -277,9 +302,83 @@ class ESPNInjuriesService {
         updated = fmtDateShort(dt);
       }
       
-      // Exact format as specified
-      return `${player} (${team}) — ${status}${noteText} · Updated ${updated} (ESPN)`;
+      // Enhanced format with all details
+      return `${newIndicator}${player} ${teamPositionInfo} — ${status}${enhancedNote} · Updated ${updated} (ESPN)`;
     }).filter(bullet => bullet !== null && bullet.length > 0);
+  }
+
+  /**
+   * Determine if an injury is "new" (within 6 hours)
+   */
+  isNewInjury(injury) {
+    const sixHoursAgo = nowTZ(DEFAULT_TIMEZONE).minus({ hours: 6 });
+    
+    if (injury.updatedISO) {
+      const injuryTime = toTZ(injury.updatedISO, DEFAULT_TIMEZONE);
+      return injuryTime >= sixHoursAgo;
+    } else if (injury.timestamp) {
+      const injuryTime = toTZ(injury.timestamp, DEFAULT_TIMEZONE);
+      return injuryTime >= sixHoursAgo;
+    }
+    
+    return false; // Default to not new if no timestamp
+  }
+
+  /**
+   * Build enhanced note with return timeline information
+   */
+  buildEnhancedNote(note) {
+    if (!note) return '';
+    
+    const cleanNote = this.sanitizeText(note);
+    const returnInfo = this.parseReturnTimeline(cleanNote);
+    
+    let enhancedNote = ` (${cleanNote}`;
+    if (returnInfo) {
+      enhancedNote += `. ${returnInfo}`;
+    }
+    enhancedNote += ')';
+    
+    return enhancedNote;
+  }
+
+  /**
+   * Parse return timeline from injury notes
+   */
+  parseReturnTimeline(note) {
+    if (!note) return null;
+    
+    const lowerNote = note.toLowerCase();
+    
+    // Look for specific return timeline patterns
+    const patterns = [
+      // Week-specific returns
+      { pattern: /week (\d+)/i, format: (match) => `Expected back: Week ${match[1]}` },
+      { pattern: /(\d+)-(\d+) weeks?/i, format: (match) => `Expected back: ${match[1]}-${match[2]} weeks` },
+      
+      // Season-ending
+      { pattern: /(season.?ending|out for.?season|done for.?season)/i, format: () => 'Out for season' },
+      
+      // Short-term status
+      { pattern: /(day.?to.?day)/i, format: () => 'Day-to-day' },
+      { pattern: /(week.?to.?week)/i, format: () => 'Week-to-week' },
+      
+      // Game-specific
+      { pattern: /(will not return|ruled out).*(game|today|tonight)/i, format: () => 'Will not return to game' },
+      { pattern: /(questionable|doubtful).*(next|upcoming).*(game|week)/i, format: () => 'Status for next game uncertain' },
+      
+      // Targeting return
+      { pattern: /targeting.*(week \d+|return)/i, format: (match) => `Targeting return: ${match[0]}` },
+    ];
+    
+    for (const { pattern, format } of patterns) {
+      const match = note.match(pattern);
+      if (match) {
+        return format(match);
+      }
+    }
+    
+    return null; // No timeline found
   }
 
   /**
@@ -344,6 +443,31 @@ class ESPNInjuriesService {
       const teamFromSrc = srcText.match(/\/([A-Z]{2,4})[\/.]/)?.[1];
       
       return teamFromAlt || teamFromSrc || null;
+    }
+    
+    return null;
+  }
+
+  /**
+   * Extract team abbreviation from raw text
+   */
+  extractTeamFromText(text) {
+    if (!text) return null;
+    
+    // Common NFL team abbreviations
+    const nflTeams = [
+      'ARI', 'ATL', 'BAL', 'BUF', 'CAR', 'CHI', 'CIN', 'CLE', 'DAL', 'DEN',
+      'DET', 'GB', 'HOU', 'IND', 'JAX', 'KC', 'LV', 'LAC', 'LAR', 'MIA',
+      'MIN', 'NE', 'NO', 'NYG', 'NYJ', 'PHI', 'PIT', 'SF', 'SEA', 'TB',
+      'TEN', 'WAS'
+    ];
+    
+    // Look for any NFL team abbreviation in the text
+    for (const team of nflTeams) {
+      const regex = new RegExp(`\\b${team}\\b`, 'i');
+      if (regex.test(text)) {
+        return team;
+      }
     }
     
     return null;
