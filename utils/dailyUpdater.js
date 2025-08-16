@@ -885,9 +885,20 @@ class DailyUpdater {
         return;
       }
 
-      const channel = await this.client.channels.fetch(config.discord.nflUpdatesChannelId);
-      if (!channel) {
-        console.error('❌ Could not find NFL updates channel');
+      let channel;
+      try {
+        channel = await this.client.channels.fetch(config.discord.nflUpdatesChannelId);
+        if (!channel) {
+          throw new Error(`Channel not found with ID: ${config.discord.nflUpdatesChannelId}`);
+        }
+      } catch (error) {
+        console.error(`❌ Failed to fetch NFL updates channel: ${error.message}`);
+        console.error(`   Channel ID attempted: ${config.discord.nflUpdatesChannelId}`);
+        console.error(`   Bot ID: ${this.client.user?.id}`);
+        if (config.discord.nflUpdatesChannelId === this.client.user?.id) {
+          console.error('   ⚠️  ERROR: NFL_UPDATES_CHANNEL_ID is set to the bot\'s user ID!');
+          console.error('   Please update NFL_UPDATES_CHANNEL_ID to a valid channel ID');
+        }
         this.logStaggeredUpdatesToConsole(nflData, timeStr, updateType);
         return;
       }
