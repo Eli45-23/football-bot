@@ -908,9 +908,14 @@ class DailyUpdater {
       console.log(`📤 Starting staggered update posting to Discord (#${channel.name})...`);
 
       // Header message with run type
-      const headerEmbed = this.createHeaderEmbed(timeStr, updateType, nflData);
-      await this.queuedSend(channel, { embeds: [headerEmbed] }, `${updateType} header message`);
-      console.log(`   📢 Posted header message`);
+      try {
+        const headerEmbed = this.createHeaderEmbed(timeStr, updateType, nflData);
+        await this.queuedSend(channel, { embeds: [headerEmbed] }, `${updateType} header message`);
+        console.log(`   📢 Posted header message`);
+      } catch (error) {
+        console.error(`❌ Failed to post header message: ${error.message}`);
+        console.error(`   Error details:`, error);
+      }
       await this.sleep(this.messageDelayMs);
 
       // 1. Injuries Section - NEW: With chunking (8 items per message)
