@@ -267,37 +267,23 @@ class SportsDBAPI {
           };
         }
         
-        // Auto-expand if too few games (enhanced for preseason)
-        if (normalizedGames.length < 10) {
-          console.log('🔄 <10 games in 7 days, expanding to 14 days...');
-          const expandedEndDate = new Date(startDate.getTime() + (14 * 24 * 60 * 60 * 1000));
+        // Auto-expand if too few games (focused on current period)
+        const config = require('../config/config');
+        const minThreshold = config.schedule.minGamesThreshold || 5;
+        const maxExpansion = config.schedule.maxExpansionDays || 10;
+        
+        if (normalizedGames.length < minThreshold) {
+          console.log(`🔄 <${minThreshold} games found, expanding to ${maxExpansion} days...`);
+          const expandedEndDate = new Date(startDate.getTime() + (maxExpansion * 24 * 60 * 60 * 1000));
           const expandedGames = this.filterGamesByDateRange(seasonData, startDate, expandedEndDate);
           const expandedNormalized = this.normalizeGameFormatFutureOnly(expandedGames);
           
-          console.log(`✅ Expanded schedule: ${expandedNormalized.length} future games found in 14-day window`);
-          
-          // If still too few games and we're in preseason period, try 21-day window
-          if (expandedNormalized.length < 8 && this.isPreseasonPeriod()) {
-            console.log('🔄 Preseason detected: <8 games in 14 days, expanding to 21 days...');
-            const preseasonEndDate = new Date(startDate.getTime() + (21 * 24 * 60 * 60 * 1000));
-            const preseasonGames = this.filterGamesByDateRange(seasonData, startDate, preseasonEndDate);
-            const preseasonNormalized = this.normalizeGameFormatFutureOnly(preseasonGames);
-            
-            console.log(`✅ Preseason schedule: ${preseasonNormalized.length} future games found in 21-day window`);
-            
-            return {
-              games: preseasonNormalized,
-              totalGames: preseasonNormalized.length,
-              source: 'League Season API (21-day preseason expansion)',
-              apiCalls: 1,
-              dateRange: { start: startDate, end: preseasonEndDate }
-            };
-          }
+          console.log(`✅ Expanded schedule: ${expandedNormalized.length} future games found in ${maxExpansion}-day window`);
           
           return {
             games: expandedNormalized,
             totalGames: expandedNormalized.length,
-            source: 'League Season API (14-day expansion)',
+            source: `League Season API (${maxExpansion}-day expansion)`,
             apiCalls: 1,
             dateRange: { start: startDate, end: expandedEndDate }
           };
@@ -537,6 +523,7 @@ class SportsDBAPI {
 
   /**
    * Parse flexible date/time formats that TheSportsDB might use
+   * FIXED: Proper timezone handling and realistic NFL game times
    */
   parseFlexibleDateTime(dateTimeStr) {
     if (!dateTimeStr) {
@@ -548,42 +535,71 @@ class SportsDBAPI {
     const cleaned = dateTimeStr.trim();
     console.log(`   🔍 [DEBUG] parseFlexibleDateTime: processing "${cleaned}"`);
     
-    // Try direct parsing first
+    // Try direct parsing first - but validate the result
     const directParse = new Date(cleaned);
     console.log(`   🔍 [DEBUG] Direct parse attempt: ${directParse.toISOString()} (valid: ${!isNaN(directParse.getTime())})`);
     if (!isNaN(directParse.getTime())) {
-      console.log(`   ✅ [DEBUG] Direct parse successful: ${directParse.getTime()}`);
-      return directParse.getTime();
-    }
-    
-    // If just a date, assume noon in Eastern Time (EDT/EST auto-detected)
-    if (/^\d{4}-\d{2}-\d{2}$/.test(cleaned)) {
-      console.log(`   🔍 [DEBUG] Date-only format detected, adding T12:00:00`);
-      // Let JavaScript handle EDT/EST automatically
-      const noonTime = new Date(`${cleaned}T12:00:00`);
-      console.log(`   🔍 [DEBUG] Noon time parse: ${noonTime.toISOString()} (valid: ${!isNaN(noonTime.getTime())})`);
-      if (!isNaN(noonTime.getTime())) {
-        console.log(`   ✅ [DEBUG] Noon time parse successful: ${noonTime.getTime()}`);
-        return noonTime.getTime();
+      // Validate that this is a reasonable NFL game time (not midnight)
+      const hour = directParse.getUTCHours();
+      const convertedEST = toTZ(directParse.getTime(), DEFAULT_TIMEZONE);
+      const estHour = convertedEST.hour;
+      
+      console.log(`   🔍 [DEBUG] Direct parse time check: UTC hour=${hour}, EST hour=${estHour}`);
+      
+      // NFL games typically between 1pm and 11pm EST - reject midnight times
+      if (estHour >= 13 && estHour <= 23) {
+        console.log(`   ✅ [DEBUG] Direct parse successful with valid time: ${directParse.getTime()}`);
+        return directParse.getTime();
+      } else {
+        console.log(`   ⚠️ [DEBUG] Direct parse rejected - invalid NFL time (${estHour}:xx EST)`);
       }
     }
     
-    // Try other common formats
-    const commonFormats = [
-      // Try with different time formats
-      `${cleaned}:00`, // Add seconds if missing
-      `${cleaned} EST`, // Add timezone
-      `${cleaned} EDT`, // Add timezone
-      `${cleaned} -0500`, // Add EST offset
-      `${cleaned} -0400`  // Add EDT offset
+    // If just a date, assume 8:00 PM EST (typical NFL primetime)
+    if (/^\d{4}-\d{2}-\d{2}$/.test(cleaned)) {
+      console.log(`   🔍 [DEBUG] Date-only format detected, using 8:00 PM EST default`);
+      
+      // Create explicit EST time (8pm) to avoid timezone confusion
+      const moment = require('moment-timezone');
+      const eveningTime = moment.tz(`${cleaned} 20:00`, 'YYYY-MM-DD HH:mm', DEFAULT_TIMEZONE);
+      
+      if (eveningTime.isValid()) {
+        console.log(`   ✅ [DEBUG] Evening time parse successful: ${eveningTime.valueOf()} (${eveningTime.format('MMM D, YYYY h:mm A z')})`);
+        return eveningTime.valueOf();
+      } else {
+        console.log(`   ❌ [DEBUG] Evening time parse failed`);
+      }
+    }
+    
+    // Try parsing with explicit timezone handling
+    const moment = require('moment-timezone');
+    
+    // Try common NFL time formats with timezone context
+    const timeFormats = [
+      // Standard formats
+      'YYYY-MM-DD HH:mm:ss',
+      'YYYY-MM-DD HH:mm',
+      'MM/DD/YYYY HH:mm',
+      'DD/MM/YYYY HH:mm',
+      
+      // With explicit timezone
+      'YYYY-MM-DD HH:mm:ss Z',
+      'YYYY-MM-DD HH:mm Z'
     ];
     
-    for (const format of commonFormats) {
-      const attempt = new Date(format);
-      console.log(`   🔍 [DEBUG] Format attempt "${format}": ${attempt.toISOString()} (valid: ${!isNaN(attempt.getTime())})`);
-      if (!isNaN(attempt.getTime())) {
-        console.log(`   ✅ [DEBUG] Format parse successful: ${attempt.getTime()}`);
-        return attempt.getTime();
+    for (const format of timeFormats) {
+      const attempt = moment.tz(cleaned, format, DEFAULT_TIMEZONE);
+      if (attempt.isValid()) {
+        const estHour = attempt.hour();
+        console.log(`   🔍 [DEBUG] Format "${format}" parsed to: ${attempt.format('MMM D, YYYY h:mm A z')} (hour: ${estHour})`);
+        
+        // Validate reasonable NFL time
+        if (estHour >= 12 && estHour <= 23) {
+          console.log(`   ✅ [DEBUG] Format parse successful with valid time: ${attempt.valueOf()}`);
+          return attempt.valueOf();
+        } else {
+          console.log(`   ⚠️ [DEBUG] Format parse rejected - invalid NFL time (${estHour}:xx EST)`);
+        }
       }
     }
     
@@ -593,6 +609,7 @@ class SportsDBAPI {
 
   /**
    * Format game date for grouping (Today, Tomorrow, Mon 8/14)
+   * FIXED: Add detailed logging to debug date calculation issues
    */
   formatGameDateGroup(gameDateTime) {
     const now = nowTZ(DEFAULT_TIMEZONE);
@@ -601,15 +618,28 @@ class SportsDBAPI {
     
     const diffDays = gameDate.diff(today, 'days').days;
     
+    // DEBUG: Add detailed logging to understand date calculation
+    console.log(`   🔍 [DATE DEBUG] formatGameDateGroup:`);
+    console.log(`   🔍 [DATE DEBUG]   Now: ${now.toFormat('MMM d, yyyy h:mm a ZZZZ')}`);
+    console.log(`   🔍 [DATE DEBUG]   Today: ${today.toFormat('MMM d, yyyy')}`);
+    console.log(`   🔍 [DATE DEBUG]   Game DateTime: ${gameDateTime.toFormat('MMM d, yyyy h:mm a ZZZZ')}`);
+    console.log(`   🔍 [DATE DEBUG]   Game Date: ${gameDate.toFormat('MMM d, yyyy')}`);
+    console.log(`   🔍 [DATE DEBUG]   Days difference: ${diffDays}`);
+    
+    let label;
     if (diffDays === 0) {
-      return 'Today';
+      label = 'Today';
     } else if (diffDays === 1) {
-      return 'Tomorrow';
+      label = 'Tomorrow';
     } else if (diffDays <= 6) {
-      return gameDateTime.toFormat('EEE M/d');
+      label = gameDateTime.toFormat('EEE M/d');
     } else {
-      return gameDateTime.toFormat('MMM dd');
+      label = gameDateTime.toFormat('MMM dd');
     }
+    
+    console.log(`   🔍 [DATE DEBUG]   Assigned label: "${label}"`);
+    
+    return label;
   }
 
   /**
@@ -721,12 +751,65 @@ class SportsDBAPI {
       }
     }).filter(game => game !== null);
     
-    // Sort ascending by kickoff time
-    processedGames.sort((a, b) => a.timestamp - b.timestamp);
+    // Add relevance scoring and prioritize current/near-term games
+    const scoredGames = this.addRelevanceScoring(processedGames);
     
-    console.log(`   ✅ Processed games: ${processedGames.length} future games after filtering`);
+    // Sort by relevance score (highest first), then by time
+    scoredGames.sort((a, b) => {
+      if (a.relevanceScore !== b.relevanceScore) {
+        return b.relevanceScore - a.relevanceScore; // Higher score first
+      }
+      return a.timestamp - b.timestamp; // Earlier time first for same score
+    });
     
-    return processedGames;
+    console.log(`   ✅ Processed games: ${scoredGames.length} future games after filtering and prioritization`);
+    
+    return scoredGames;
+  }
+
+  /**
+   * Add relevance scoring to prioritize current/near-term games
+   * @param {Array} games - Array of processed game objects
+   * @returns {Array} Games with relevance scores added
+   */
+  addRelevanceScoring(games) {
+    const now = nowTZ(DEFAULT_TIMEZONE);
+    
+    return games.map(game => {
+      const gameTime = toTZ(game.timestamp, DEFAULT_TIMEZONE);
+      const hoursUntilGame = gameTime.diff(now, 'hours');
+      const daysUntilGame = Math.ceil(hoursUntilGame / 24);
+      
+      // Scoring system: prioritize sooner games
+      let relevanceScore = 100;
+      
+      if (hoursUntilGame <= 6) {
+        relevanceScore = 1000; // Starting soon - highest priority
+      } else if (hoursUntilGame <= 12) {
+        relevanceScore = 900;  // Today - very high priority
+      } else if (hoursUntilGame <= 24) {
+        relevanceScore = 800;  // Later today - high priority
+      } else if (daysUntilGame <= 2) {
+        relevanceScore = 700;  // Tomorrow - high priority
+      } else if (daysUntilGame <= 3) {
+        relevanceScore = 600;  // Day after tomorrow - medium-high
+      } else if (daysUntilGame <= 5) {
+        relevanceScore = 400;  // This week - medium priority
+      } else if (daysUntilGame <= 7) {
+        relevanceScore = 200;  // Next week - low priority
+      } else {
+        relevanceScore = 100;  // Far future - lowest priority
+      }
+      
+      console.log(`   🏈 Game: ${game.awayTeam} @ ${game.homeTeam} - ${daysUntilGame}d away - Score: ${relevanceScore}`);
+      
+      return {
+        ...game,
+        relevanceScore,
+        daysUntilGame,
+        hoursUntilGame
+      };
+    });
   }
 
   /**

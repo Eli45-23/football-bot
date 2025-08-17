@@ -101,10 +101,11 @@ const config = {
   },
   timezone: 'America/New_York',
   
-  // Schedule Window Configuration
+  // Schedule Window Configuration  
   schedule: {
-    windowDays: 14,           // 14-day total window (7 days back, 7 days forward)
-    minGamesThreshold: 10,    // Expand window if fewer than 10 games found
+    windowDays: 7,            // 7-day total window (focus on current week)
+    minGamesThreshold: 5,     // Expand window if fewer than 5 games found
+    maxExpansionDays: 10,     // Maximum expansion to 10 days (was 21)
     maxMessagesPerCategory: 5, // Max Discord messages per category
     pagination: {
       injuries: 8,            // Items per injuries message

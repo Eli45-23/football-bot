@@ -308,18 +308,18 @@ class DailyUpdater {
    * @returns {Object} Schedule data with windowing metadata
    */
   async collectLeagueScheduleWithWindowing() {
-    console.log('📅 Collecting NFL league schedule with intelligent windowing...');
+    console.log('📅 Collecting NFL league schedule with focused windowing...');
     
     const now = moment().tz(config.timezone);
     
-    // Phase 1: Try 14-day forward window (today + 14 days) for better preseason coverage
+    // Phase 1: Try configured window (default 7-day forward) for focused relevant games
     let startDate = now.clone().startOf('day').toDate();
-    let endDate = now.clone().add(14, 'days').endOf('day').toDate();
+    let endDate = now.clone().add(config.schedule.windowDays, 'days').endOf('day').toDate();
     
-    console.log(`📋 Phase 1: Trying 14-day forward window (${startDate.toISOString().split('T')[0]} to ${endDate.toISOString().split('T')[0]})`);
+    console.log(`📋 Phase 1: Trying ${config.schedule.windowDays}-day forward window (${startDate.toISOString().split('T')[0]} to ${endDate.toISOString().split('T')[0]})`);
     
     let scheduleResult = await sportsdb.getLeagueSchedule(startDate, endDate);
-    let windowUsed = '14 days';
+    let windowUsed = `${config.schedule.windowDays} days`;
     let windowExpanded = false;
     
     // DEBUG: Log the raw API result
@@ -329,16 +329,17 @@ class DailyUpdater {
       source: scheduleResult.source
     });
     
-    // Phase 2: Expand to 21 days if fewer than 10 games found
+    // Phase 2: Expand to max window if fewer than threshold games found
     if (scheduleResult.totalGames < config.schedule.minGamesThreshold) {
-      console.log(`📋 Phase 2: Only ${scheduleResult.totalGames} games found, expanding to 21-day window...`);
+      const maxDays = config.schedule.maxExpansionDays || 10;
+      console.log(`📋 Phase 2: Only ${scheduleResult.totalGames} games found, expanding to ${maxDays}-day window...`);
       
-      // Keep start date as today, expand end date further to find more future games
+      // Keep start date as today, expand end date to maximum configured window
       startDate = now.clone().startOf('day').toDate();
-      endDate = now.clone().add(21, 'days').endOf('day').toDate();
+      endDate = now.clone().add(maxDays, 'days').endOf('day').toDate();
       
       scheduleResult = await sportsdb.getLeagueSchedule(startDate, endDate);
-      windowUsed = '21 days';
+      windowUsed = `${maxDays} days`;
       windowExpanded = true;
       
       // DEBUG: Log the expanded API result
