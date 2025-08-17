@@ -3,6 +3,8 @@ const { JSDOM } = require('jsdom');
 const { toTZ, nowTZ, fmtDateShort } = require('../src/utils/time');
 
 const teamMappings = require('../config/nflTeamMappings');
+const playerTeamMapping = require('./playerTeamMapping');
+const { getManualTeamOverride } = require('../config/manualTeamOverrides');
 
 /**
  * ESPN Injuries Table Scraper with proper date filtering and formatting
@@ -189,6 +191,19 @@ class ESPNInjuriesService {
     if (!teamAbbr) {
       const rowText = row.textContent || '';
       teamAbbr = this.extractTeamFromText(rowText);
+    }
+
+    // Manual team override (highest priority for edge cases)
+    if (player) {
+      const manualOverride = getManualTeamOverride(player);
+      if (manualOverride) {
+        teamAbbr = manualOverride;
+      }
+    }
+
+    // Final fallback: use player-to-team mapping service
+    if (!teamAbbr && player) {
+      teamAbbr = playerTeamMapping.getTeamForPlayer(player);
     }
 
     // Skip game date (third cell) - this is NOT the update date!
@@ -502,33 +517,98 @@ class ESPNInjuriesService {
 
   /**
    * Extract team from injury notes by looking for team name mentions
+   * ENHANCED: Better pattern matching for ESPN injury note formats
    */
   extractTeamFromNotes(noteText) {
     if (!noteText) return null;
     
-    // Map team names to abbreviations
+    console.log(`   🔍 TEAM EXTRACTION DEBUG: Processing note: "${noteText.substring(0, 100)}..."`);
+    
+    // Map team names to abbreviations (comprehensive)
     const teamNameMap = {
-      'cardinals': 'ARI', 'falcons': 'ATL', 'ravens': 'BAL', 'bills': 'BUF',
-      'panthers': 'CAR', 'bears': 'CHI', 'bengals': 'CIN', 'browns': 'CLE',
-      'cowboys': 'DAL', 'broncos': 'DEN', 'lions': 'DET', 'packers': 'GB',
-      'texans': 'HOU', 'colts': 'IND', 'jaguars': 'JAX', 'chiefs': 'KC',
-      'raiders': 'LV', 'chargers': 'LAC', 'rams': 'LAR', 'dolphins': 'MIA',
-      'vikings': 'MIN', 'patriots': 'NE', 'saints': 'NO', 'giants': 'NYG',
-      'jets': 'NYJ', 'eagles': 'PHI', 'steelers': 'PIT', '49ers': 'SF',
-      'seahawks': 'SEA', 'buccaneers': 'TB', 'titans': 'TEN', 'commanders': 'WAS'
+      // Team names and possessive forms
+      'cardinals': 'ARI', 'cardinal': 'ARI',
+      'falcons': 'ATL', 'falcon': 'ATL',
+      'ravens': 'BAL', 'raven': 'BAL',
+      'bills': 'BUF', 'bill': 'BUF',
+      'panthers': 'CAR', 'panther': 'CAR',
+      'bears': 'CHI', 'bear': 'CHI',
+      'bengals': 'CIN', 'bengal': 'CIN',
+      'browns': 'CLE', 'brown': 'CLE',
+      'cowboys': 'DAL', 'cowboy': 'DAL',
+      'broncos': 'DEN', 'bronco': 'DEN',
+      'lions': 'DET', 'lion': 'DET',
+      'packers': 'GB', 'packer': 'GB',
+      'texans': 'HOU', 'texan': 'HOU',
+      'colts': 'IND', 'colt': 'IND',
+      'jaguars': 'JAX', 'jaguar': 'JAX',
+      'chiefs': 'KC', 'chief': 'KC',
+      'raiders': 'LV', 'raider': 'LV',
+      'chargers': 'LAC', 'charger': 'LAC',
+      'rams': 'LAR', 'ram': 'LAR',
+      'dolphins': 'MIA', 'dolphin': 'MIA',
+      'vikings': 'MIN', 'viking': 'MIN',
+      'patriots': 'NE', 'patriot': 'NE',
+      'saints': 'NO', 'saint': 'NO',
+      'giants': 'NYG', 'giant': 'NYG',
+      'jets': 'NYJ', 'jet': 'NYJ',
+      'eagles': 'PHI', 'eagle': 'PHI',
+      'steelers': 'PIT', 'steeler': 'PIT',
+      '49ers': 'SF', 'niners': 'SF',
+      'seahawks': 'SEA', 'seahawk': 'SEA',
+      'buccaneers': 'TB', 'buccaneer': 'TB', 'bucs': 'TB',
+      'titans': 'TEN', 'titan': 'TEN',
+      'commanders': 'WAS', 'commander': 'WAS'
     };
     
     const lowerText = noteText.toLowerCase();
     
-    // Look for team name mentions
+    // Enhanced pattern matching for ESPN-specific formats
+    const patterns = [
+      // Possessive forms: "Cardinals' official site", "Patriots' coach"
+      /(cardinals?|falcons?|ravens?|bills?|panthers?|bears?|bengals?|browns?|cowboys?|broncos?|lions?|packers?|texans?|colts?|jaguars?|chiefs?|raiders?|chargers?|rams?|dolphins?|vikings?|patriots?|saints?|giants?|jets?|eagles?|steelers?|49ers?|niners?|seahawks?|buccaneers?|bucs?|titans?|commanders?)['']s?\s+(official\s+site|coach|reporter|beat\s+writer|sources?|website|staff)/i,
+      
+      // "According to [Team]" format
+      /according\s+to\s+(?:the\s+)?(cardinals?|falcons?|ravens?|bills?|panthers?|bears?|bengals?|browns?|cowboys?|broncos?|lions?|packers?|texans?|colts?|jaguars?|chiefs?|raiders?|chargers?|rams?|dolphins?|vikings?|patriots?|saints?|giants?|jets?|eagles?|steelers?|49ers?|niners?|seahawks?|buccaneers?|bucs?|titans?|commanders?)/i,
+      
+      // Reporter attribution: "of [Team].com reports", "of ESPN.com reports"
+      /of\s+(?:the\s+)?(cardinals?|falcons?|ravens?|bills?|panthers?|bears?|bengals?|browns?|cowboys?|broncos?|lions?|packers?|texans?|colts?|jaguars?|chiefs?|raiders?|chargers?|rams?|dolphins?|vikings?|patriots?|saints?|giants?|jets?|eagles?|steelers?|49ers?|niners?|seahawks?|buccaneers?|bucs?|titans?|commanders?)(?:\.com|s?\s+official)/i,
+      
+      // Direct team mentions in context
+      /(?:the\s+)?(cardinals?|falcons?|ravens?|bills?|panthers?|bears?|bengals?|browns?|cowboys?|broncos?|lions?|packers?|texans?|colts?|jaguars?|chiefs?|raiders?|chargers?|rams?|dolphins?|vikings?|patriots?|saints?|giants?|jets?|eagles?|steelers?|49ers?|niners?|seahawks?|buccaneers?|bucs?|titans?|commanders?)\s+(have|will|coach|said|announced|confirmed|placed|activated)/i
+    ];
+    
+    // Try each pattern
+    for (const pattern of patterns) {
+      const match = lowerText.match(pattern);
+      if (match) {
+        const teamName = match[1].toLowerCase();
+        const abbr = teamNameMap[teamName];
+        if (abbr) {
+          console.log(`   ✅ TEAM FOUND via pattern: "${teamName}" → ${abbr}`);
+          return abbr;
+        }
+      }
+    }
+    
+    // Fallback: simple team name search
     for (const [teamName, abbr] of Object.entries(teamNameMap)) {
-      if (lowerText.includes(teamName)) {
+      const regex = new RegExp(`\\b${teamName}\\b`, 'i');
+      if (regex.test(lowerText)) {
+        console.log(`   ✅ TEAM FOUND via fallback: "${teamName}" → ${abbr}`);
         return abbr;
       }
     }
     
     // Also check for abbreviations that might be in the notes
-    return this.extractTeamFromText(noteText);
+    const abbrResult = this.extractTeamFromText(noteText);
+    if (abbrResult) {
+      console.log(`   ✅ TEAM FOUND via abbreviation: ${abbrResult}`);
+      return abbrResult;
+    }
+    
+    console.log(`   ❌ NO TEAM FOUND in note`);
+    return null;
   }
 
   /**
