@@ -40,11 +40,12 @@ const config = {
       const year = now.getFullYear();
       const month = now.getMonth(); // 0-based: 0=Jan, 7=Aug
       
-      // NFL season runs from August of year X to February of year X+1
-      // In August 2025, we're looking for 2024-2025 season data
-      if (month >= 7) { // August or later
-        return (year - 1).toString(); // Use previous year (2024 for Aug 2025)
-      } else { // January through July
+      // CORRECTED: In August 2025, we're in 2025 preseason
+      // NFL preseason runs July-August of the current year
+      // Regular season runs September of year X to February of year X+1
+      if (month >= 7) { // August or later - current year preseason/season
+        return year.toString(); // Use current year (2025 for Aug 2025)
+      } else { // January through July - previous season ending
         return (year - 1).toString(); // Use previous year
       }
     },

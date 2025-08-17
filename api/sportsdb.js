@@ -545,78 +545,46 @@ class SportsDBAPI {
   
   /**
    * Parse game date/time to America/New_York timezone
-   * Convert all event datetimes to America/New_York as required
-   * ENHANCED: Use strTimeLocal as fallback for better time accuracy
+   * SIMPLIFIED: Focus on primary date fields with consistent timezone handling
    */
   parseGameDateToTZ(game) {
-    // Note: Parse multiple TheSportsDB date formats (dateEvent, strTime, etc.)
-    
-    // Try various date fields that TheSportsDB might use
-    const dateFields = [
-      game.dateEvent,
-      game.strDate,
-      game.strTimestamp,
-      game.dateEventLocal
+    // FIXED: Prioritize dateEventLocal (local date) over dateEvent (UTC date)
+    const attempts = [
+      // PRIMARY: Use dateEventLocal which represents actual game date
+      { date: game.dateEventLocal, time: game.strTimeLocal },
+      { date: game.dateEventLocal, time: game.strTime },
+      { date: game.dateEventLocal, time: null }, // Date only, default to 8 PM
+      
+      // FALLBACK: Use dateEvent as backup
+      { date: game.dateEvent, time: game.strTimeLocal },
+      { date: game.dateEvent, time: game.strTime },
+      { date: game.strDate, time: game.strTimeLocal },
+      { date: game.strTimestamp, time: null }
     ];
     
-    // Try multiple time fields - prioritize local time over UTC
-    const timeFields = [
-      game.strTimeLocal, // Often more accurate (e.g., "19:00:00" for 7 PM)
-      game.strTime       // UTC time (sometimes "00:00:00" which is invalid)
-    ];
-    
-    // First, try combining date with local time
-    for (const timeField of timeFields) {
-      if (!timeField) continue;
-      
-      console.log(`   🔍 [DEBUG] Trying time field: "${timeField}"`);
-      
-      for (const dateStr of dateFields) {
-        if (!dateStr) continue;
-        
-        try {
-          // Handle different date formats
-          let fullDateTimeStr = dateStr;
-          
-          // If we have a separate time field, combine them
-          if (timeField && !dateStr.includes(':')) {
-            fullDateTimeStr = `${dateStr} ${timeField}`;
-          }
-          
-          console.log(`   🔍 [DEBUG] Trying combined datetime: "${fullDateTimeStr}"`);
-          
-          // Parse and convert to America/New_York timezone
-          const parsed = this.parseFlexibleDateTime(fullDateTimeStr);
-          
-          if (parsed) {
-            const converted = toTZ(parsed, DEFAULT_TIMEZONE);
-            console.log(`   ✅ [DEBUG] Successfully parsed game time: ${converted.toFormat('MMM d, yyyy h:mm a ZZZZ')}`);
-            return converted;
-          }
-          
-        } catch (error) {
-          console.log(`   ❌ [DEBUG] Parse error for "${dateStr} ${timeField}": ${error.message}`);
-        }
-      }
-    }
-    
-    // Fallback: try date-only fields and default to evening time
-    for (const dateStr of dateFields) {
-      if (!dateStr) continue;
+    for (const { date, time } of attempts) {
+      if (!date) continue;
       
       try {
-        // For date-only fields, our parseFlexibleDateTime already defaults to 8 PM EST
-        console.log(`   🔍 [DEBUG] Trying date-only fallback: "${dateStr}"`);
-        const parsed = this.parseFlexibleDateTime(dateStr);
+        // Build datetime string
+        let fullDateTimeStr = date;
+        if (time && !date.includes(':')) {
+          fullDateTimeStr = `${date} ${time}`;
+        }
+        
+        console.log(`   🔍 [DEBUG] Parsing: "${fullDateTimeStr}"`);
+        
+        // Parse and convert to EST/EDT
+        const parsed = this.parseFlexibleDateTime(fullDateTimeStr);
         
         if (parsed) {
           const converted = toTZ(parsed, DEFAULT_TIMEZONE);
-          console.log(`   ✅ [DEBUG] Date-only fallback successful: ${converted.toFormat('MMM d, yyyy h:mm a ZZZZ')}`);
+          console.log(`   ✅ [DEBUG] Successfully parsed: ${converted.toFormat('MMM d, yyyy h:mm a ZZZZ')}`);
           return converted;
         }
         
       } catch (error) {
-        console.log(`   ❌ [DEBUG] Date-only parse error for "${dateStr}": ${error.message}`);
+        console.log(`   ❌ [DEBUG] Parse error: ${error.message}`);
       }
     }
     
@@ -646,21 +614,14 @@ class SportsDBAPI {
     const directParse = new Date(cleaned);
     console.log(`   🔍 [DEBUG] Direct parse attempt: ${directParse.toISOString()} (valid: ${!isNaN(directParse.getTime())})`);
     if (!isNaN(directParse.getTime())) {
-      // CRITICAL: Reject dates from wrong year (old data)
+      // SIMPLIFIED: Accept current year and reasonable range for NFL games
       const parsedYear = directParse.getFullYear();
-      const parsedMonth = directParse.getMonth();
       
-      // For August 2025, reject 2024 games UNLESS it's current preseason data
-      // Accept 2024 data only if we're in Aug-Dec 2025 looking for 2024-2025 season
-      let isValidYear = false;
-      if (currentYear === 2025 && currentMonth >= 7) { // Aug 2025 or later
-        isValidYear = parsedYear === 2024 || parsedYear === 2025; // Accept both 2024 and 2025
-      } else {
-        isValidYear = parsedYear >= currentYear - 1; // Accept current and previous year
-      }
+      // Accept games from current year (2025) - much simpler validation
+      const isValidYear = parsedYear === currentYear;
       
       if (!isValidYear) {
-        console.log(`   🗑️ [DEBUG] Direct parse rejected - wrong year (${parsedYear}, expected ${currentYear} or ${currentYear-1})`);
+        console.log(`   🗑️ [DEBUG] Direct parse rejected - wrong year (${parsedYear}, expected ${currentYear})`);
         return null;
       }
       
@@ -687,15 +648,10 @@ class SportsDBAPI {
       const yearMatch = cleaned.match(/^(\d{4})/);
       if (yearMatch) {
         const parsedYear = parseInt(yearMatch[1]);
-        let isValidYear = false;
-        if (currentYear === 2025 && currentMonth >= 7) { // Aug 2025 or later
-          isValidYear = parsedYear === 2024 || parsedYear === 2025;
-        } else {
-          isValidYear = parsedYear >= currentYear - 1;
-        }
+        const isValidYear = parsedYear === currentYear;
         
         if (!isValidYear) {
-          console.log(`   🗑️ [DEBUG] Date-only rejected - wrong year (${parsedYear})`);
+          console.log(`   🗑️ [DEBUG] Date-only rejected - wrong year (${parsedYear}, expected ${currentYear})`);
           return null;
         }
       }
@@ -737,15 +693,10 @@ class SportsDBAPI {
         console.log(`   🔍 [DEBUG] Format "${format}" parsed to: ${attempt.format('MMM D, YYYY h:mm A z')} (hour: ${estHour}, year: ${parsedYear})`);
         
         // Validate year
-        let isValidYear = false;
-        if (currentYear === 2025 && currentMonth >= 7) {
-          isValidYear = parsedYear === 2024 || parsedYear === 2025;
-        } else {
-          isValidYear = parsedYear >= currentYear - 1;
-        }
+        const isValidYear = parsedYear === currentYear;
         
         if (!isValidYear) {
-          console.log(`   🗑️ [DEBUG] Format parse rejected - wrong year (${parsedYear})`);
+          console.log(`   🗑️ [DEBUG] Format parse rejected - wrong year (${parsedYear}, expected ${currentYear})`);
           continue;
         }
         
@@ -765,35 +716,33 @@ class SportsDBAPI {
 
   /**
    * Format game date for grouping (Today, Tomorrow, Mon 8/14)
-   * FIXED: Add detailed logging to debug date calculation issues
+   * FIXED: Simplified and accurate date calculation
    */
   formatGameDateGroup(gameDateTime) {
     const now = nowTZ(DEFAULT_TIMEZONE);
     const today = now.startOf('day');
     const gameDate = gameDateTime.startOf('day');
     
-    const diffDays = gameDate.diff(today, 'days').days;
+    // Use Math.round to avoid floating point precision issues
+    const diffDays = Math.round(gameDate.diff(today, 'days').days);
     
-    // DEBUG: Add detailed logging to understand date calculation
-    console.log(`   🔍 [DATE DEBUG] formatGameDateGroup:`);
-    console.log(`   🔍 [DATE DEBUG]   Now: ${now.toFormat('MMM d, yyyy h:mm a ZZZZ')}`);
-    console.log(`   🔍 [DATE DEBUG]   Today: ${today.toFormat('MMM d, yyyy')}`);
-    console.log(`   🔍 [DATE DEBUG]   Game DateTime: ${gameDateTime.toFormat('MMM d, yyyy h:mm a ZZZZ')}`);
-    console.log(`   🔍 [DATE DEBUG]   Game Date: ${gameDate.toFormat('MMM d, yyyy')}`);
-    console.log(`   🔍 [DATE DEBUG]   Days difference: ${diffDays}`);
+    console.log(`   📅 [DATE] Game: ${gameDateTime.toFormat('MMM d, yyyy h:mm a')} | Today: ${today.toFormat('MMM d, yyyy')} | Diff: ${diffDays} days`);
     
     let label;
     if (diffDays === 0) {
       label = 'Today';
     } else if (diffDays === 1) {
       label = 'Tomorrow';
-    } else if (diffDays <= 6) {
+    } else if (diffDays >= 2 && diffDays <= 6) {
       label = gameDateTime.toFormat('EEE M/d');
+    } else if (diffDays < 0) {
+      // Past games (shouldn't show up, but handle gracefully)
+      label = 'Past';
     } else {
       label = gameDateTime.toFormat('MMM dd');
     }
     
-    console.log(`   🔍 [DATE DEBUG]   Assigned label: "${label}"`);
+    console.log(`   📅 [DATE] Label: "${label}"`);
     
     return label;
   }
@@ -895,9 +844,10 @@ class SportsDBAPI {
           // Don't skip, but log the issue
         }
         
-        // Skip games that are already finished/completed
+        // Skip games that are already finished/completed (expanded list)
         const gameStatus = game.strStatus;
-        if (gameStatus === 'FT' || gameStatus === 'Finished' || gameStatus === 'Final') {
+        const finishedStatuses = ['FT', 'Finished', 'Final', 'Completed', 'Complete', 'FINAL', 'FINISHED'];
+        if (finishedStatuses.includes(gameStatus)) {
           finishedGameCount++;
           console.log(`   🏁 SKIPPING FINISHED GAME: ${awayTeam} @ ${homeTeam} (Status: ${gameStatus})`);
           return null;
