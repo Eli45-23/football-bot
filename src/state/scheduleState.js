@@ -15,7 +15,6 @@ class ScheduleState {
     this.defaultState = {
       lastRuns: {
         morning: 0,
-        afternoon: 0,
         evening: 0
       }
     };
@@ -23,7 +22,6 @@ class ScheduleState {
     this.defaultHashState = {
       lastHashes: {
         morning: '',
-        afternoon: '',
         evening: ''
       }
     };
@@ -56,7 +54,6 @@ class ScheduleState {
       return {
         lastRuns: {
           morning: state.lastRuns?.morning || 0,
-          afternoon: state.lastRuns?.afternoon || 0,
           evening: state.lastRuns?.evening || 0
         }
       };
@@ -82,7 +79,6 @@ class ScheduleState {
       return {
         lastHashes: {
           morning: state.lastHashes?.morning || '',
-          afternoon: state.lastHashes?.afternoon || '',
           evening: state.lastHashes?.evening || ''
         }
       };
@@ -118,8 +114,8 @@ class ScheduleState {
    * @param {number} timestamp - Run timestamp
    */
   async setRun(slot, timestamp) {
-    if (!['morning', 'afternoon', 'evening'].includes(slot)) {
-      throw new Error(`Invalid slot: ${slot}. Must be morning, afternoon, or evening`);
+    if (!['morning', 'evening'].includes(slot)) {
+      throw new Error(`Invalid slot: ${slot}. Must be morning or evening`);
     }
 
     const state = await this.getState();
@@ -135,8 +131,8 @@ class ScheduleState {
    * @param {string} hash - Content hash of the posted update
    */
   async setLastHash(slot, hash) {
-    if (!['morning', 'afternoon', 'evening'].includes(slot)) {
-      throw new Error(`Invalid slot: ${slot}. Must be morning, afternoon, or evening`);
+    if (!['morning', 'evening'].includes(slot)) {
+      throw new Error(`Invalid slot: ${slot}. Must be morning or evening`);
     }
 
     const hashState = await this.getHashState();
@@ -152,8 +148,8 @@ class ScheduleState {
    * @returns {Promise<string|null>} Last hash or null if not found
    */
   async getLastHash(slot) {
-    if (!['morning', 'afternoon', 'evening'].includes(slot)) {
-      throw new Error(`Invalid slot: ${slot}. Must be morning, afternoon, or evening`);
+    if (!['morning', 'evening'].includes(slot)) {
+      throw new Error(`Invalid slot: ${slot}. Must be morning or evening`);
     }
 
     const hashState = await this.getHashState();
@@ -173,7 +169,6 @@ class ScheduleState {
     // EST slot times (hours in 24h format)
     const slotTimes = {
       morning: 8,   // 8:00 AM EST
-      afternoon: 14, // 2:00 PM EST  
       evening: 20   // 8:00 PM EST
     };
 

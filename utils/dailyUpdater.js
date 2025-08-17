@@ -134,16 +134,18 @@ class DailyUpdater {
       // Compute payloadHash BEFORE posting for duplicate detection
       const payloadHash = dedupHashService.generateContentHash(nflData, updateType, timeStr);
       
-      // Early return on duplicate - no footer or empty sections posted
+      // Check for duplicate content but don't skip posting
       const isDuplicate = await dedupHashService.isDuplicateEnhanced(payloadHash, updateType);
       if (isDuplicate) {
-        runLogger.log('warn', 'Duplicate content detected - early return', { payloadHash, updateType });
-        console.log(`🔒 Early return: ${updateType} update content unchanged (hash: ${payloadHash.substring(0, 8)}...)`);
-        runLogger.endRun('skipped', { reason: 'duplicate_content', payloadHash });
-        return; // Early return → no footer or empty sections posted
+        runLogger.log('info', 'Content unchanged since last update - posting anyway', { payloadHash, updateType });
+        console.log(`📋 Content unchanged since last ${updateType} update (hash: ${payloadHash.substring(0, 8)}...) - posting scheduled update anyway`);
+        // Continue with posting even if content is duplicate
       }
       
       console.log(`✅ Payload verification passed, proceeding with ${updateType} update (hash: ${payloadHash.substring(0, 8)}...)`);
+      
+      // Pass duplicate status to posting function
+      nflData.isDuplicate = isDuplicate;
       
       // Post categorized updates to Discord (5 separate messages)
       await this.postStaggeredUpdatesToDiscord(nflData, timeStr, updateType, payloadHash);
@@ -975,6 +977,12 @@ class DailyUpdater {
    */
   buildEnhancedHeaderDescription(nflData, updateType) {
     const descriptionParts = [];
+    
+    // Add status indicator if content is unchanged
+    if (nflData.isDuplicate) {
+      descriptionParts.push('📋 **Status: No new updates since last post** (scheduled update)');
+      descriptionParts.push('');  // Add spacing
+    }
     
     // League mode header format instead of team processing stats
     if (nflData.apiCallsUsed && nflData.windowUsed) {

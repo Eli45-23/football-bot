@@ -18,10 +18,9 @@ class DailyScheduler {
     // EST timezone for all scheduling
     this.timezone = 'America/New_York';
     
-    // Slot definitions with times in 24h format
+    // Slot definitions with times in 24h format (twice daily)
     this.slots = {
       morning: { hour: 8, minute: 0, name: 'Morning Update' },
-      afternoon: { hour: 14, minute: 0, name: 'Afternoon Update' },
       evening: { hour: 20, minute: 0, name: 'Evening Update' }
     };
     
@@ -46,7 +45,7 @@ class DailyScheduler {
 
     console.log('🚀 Initializing resilient daily scheduler...');
     console.log(`📍 Timezone: ${this.timezone}`);
-    console.log(`🕐 Scheduled times: 08:00, 14:00, 20:00 EST`);
+    console.log(`🕐 Scheduled times: 08:00, 20:00 EST (twice daily)`);
 
     // Schedule all slots
     for (const [slotName] of Object.entries(this.slots)) {
