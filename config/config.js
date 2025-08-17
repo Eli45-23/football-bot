@@ -34,7 +34,23 @@ const config = {
       lookupFormerTeams: '/lookupformerteams.php'
     },
     nflLeagueId: '4391', // NFL League ID for TheSportsDB
-    currentSeason: '2025' // Current NFL season (Aug 2025 preseason games)
+    getCurrentSeason: () => {
+      // Auto-detect current NFL season based on date
+      const now = new Date();
+      const year = now.getFullYear();
+      const month = now.getMonth(); // 0-based: 0=Jan, 7=Aug
+      
+      // NFL season runs from August of year X to February of year X+1
+      // In August 2025, we're looking for 2024-2025 season data
+      if (month >= 7) { // August or later
+        return (year - 1).toString(); // Use previous year (2024 for Aug 2025)
+      } else { // January through July
+        return (year - 1).toString(); // Use previous year
+      }
+    },
+    get currentSeason() {
+      return this.getCurrentSeason();
+    }
   },
 
   // OpenAI Configuration

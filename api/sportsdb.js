@@ -6,6 +6,10 @@ const { getTeamId } = require('../config/nflTeamMappings');
 const textUtils = require('../src/utils/text');
 const apiQueue = require('../lib/apiQueue');
 
+// Import fallback schedule services
+const espnScheduleService = require('../services/espnSchedule');
+const nflScheduleService = require('../services/nflSchedule');
+
 /**
  * TheSportsDB API Service with future-only schedule filtering
  * Handles all interactions with TheSportsDB API for NFL data
@@ -232,95 +236,159 @@ class SportsDBAPI {
   }
 
   /**
-   * Get league-wide NFL schedule with future-only filtering and timezone conversion
+   * Get league-wide NFL schedule with multiple data sources and fallbacks
    * @param {Date} startDate - Start date for schedule window
    * @param {Date} endDate - End date for schedule window
    * @returns {Promise<Object>} Schedule data with future games only
    */
   async getLeagueSchedule(startDate, endDate) {
+    console.log(`📅 Fetching NFL league schedule (multi-source): ${startDate.toISOString().split('T')[0]} to ${endDate.toISOString().split('T')[0]}`);
+    console.log(`   🔍 Current season: ${this.currentSeason}`);
+    
+    const minThreshold = config.schedule.minGamesThreshold || 5;
+    
+    // PRIMARY SOURCE: TheSportsDB API
     try {
-      console.log(`📅 Fetching NFL league schedule (future-only): ${startDate.toISOString().split('T')[0]} to ${endDate.toISOString().split('T')[0]}`);
+      console.log('🥇 PRIMARY: Trying TheSportsDB API...');
+      const theSportsDBResult = await this.fetchFromTheSportsDB(startDate, endDate);
       
-      // Try season endpoint first, but check if comprehensive during preseason
-      const seasonData = await this.getSeasonSchedule(this.currentSeason);
-      if (seasonData && seasonData.length > 0) {
-        const filteredGames = this.filterGamesByDateRange(seasonData, startDate, endDate);
-        const normalizedGames = this.normalizeGameFormatFutureOnly(filteredGames);
+      if (theSportsDBResult.games.length >= minThreshold) {
+        console.log(`✅ TheSportsDB SUCCESS: ${theSportsDBResult.games.length} games found`);
+        return theSportsDBResult;
+      } else {
+        console.log(`⚠️ TheSportsDB insufficient: Only ${theSportsDBResult.games.length} games (need ${minThreshold})`);
+      }
+    } catch (error) {
+      console.log(`❌ TheSportsDB FAILED: ${error.message}`);
+    }
+    
+    // SECONDARY SOURCE: ESPN Schedule Scraper
+    try {
+      console.log('🥈 SECONDARY: Trying ESPN schedule scraper...');
+      const espnResult = await espnScheduleService.fetchSchedule(startDate, endDate);
+      
+      if (espnResult.games.length >= minThreshold) {
+        console.log(`✅ ESPN SCRAPER SUCCESS: ${espnResult.games.length} games found`);
+        return {
+          games: espnResult.games,
+          totalGames: espnResult.games.length,
+          source: espnResult.source,
+          dateRange: { start: startDate, end: endDate },
+          fallbackUsed: true
+        };
+      } else {
+        console.log(`⚠️ ESPN SCRAPER insufficient: Only ${espnResult.games.length} games (need ${minThreshold})`);
+      }
+    } catch (error) {
+      console.log(`❌ ESPN SCRAPER FAILED: ${error.message}`);
+    }
+    
+    // TERTIARY SOURCE: NFL.com Schedule Scraper
+    try {
+      console.log('🥉 TERTIARY: Trying NFL.com schedule scraper...');
+      const nflResult = await nflScheduleService.fetchSchedule(startDate, endDate);
+      
+      if (nflResult.games.length > 0) {
+        console.log(`✅ NFL.COM SCRAPER SUCCESS: ${nflResult.games.length} games found`);
+        return {
+          games: nflResult.games,
+          totalGames: nflResult.games.length,
+          source: nflResult.source,
+          dateRange: { start: startDate, end: endDate },
+          fallbackUsed: true
+        };
+      } else {
+        console.log(`⚠️ NFL.COM SCRAPER insufficient: Only ${nflResult.games.length} games`);
+      }
+    } catch (error) {
+      console.log(`❌ NFL.COM SCRAPER FAILED: ${error.message}`);
+    }
+    
+    // FINAL FALLBACK: Team-by-team approach (legacy method)
+    console.log('🔄 FINAL FALLBACK: Using team-by-team schedule fetching...');
+    return await this.getTeamBasedSchedule(startDate, endDate);
+  }
+
+  /**
+   * Fetch schedule from TheSportsDB API (original logic)
+   * @param {Date} startDate - Start date for schedule window
+   * @param {Date} endDate - End date for schedule window
+   * @returns {Promise<Object>} Schedule data from TheSportsDB
+   */
+  async fetchFromTheSportsDB(startDate, endDate) {
+    console.log(`   📡 Fetching from TheSportsDB (season: ${this.currentSeason})...`);
+    
+    // Try season endpoint first, but check if comprehensive during preseason
+    const seasonData = await this.getSeasonSchedule(this.currentSeason);
+    if (seasonData && seasonData.length > 0) {
+      const filteredGames = this.filterGamesByDateRange(seasonData, startDate, endDate);
+      const normalizedGames = this.normalizeGameFormatFutureOnly(filteredGames);
+      
+      console.log(`   📊 TheSportsDB season data: ${normalizedGames.length} future games found in date range`);
+      
+      // During preseason, if we have few games, use comprehensive date queries instead
+      if (this.isPreseasonPeriod() && normalizedGames.length < 8) {
+        console.log('   🏈 Preseason period detected with limited games - switching to comprehensive date queries...');
         
-        console.log(`✅ League schedule: ${normalizedGames.length} future games found in date range`);
+        const dateSpecificGames = await this.getGamesByDateRange(startDate, endDate);
+        const comprehensiveNormalized = this.normalizeGameFormatFutureOnly(dateSpecificGames.games);
         
-        // During preseason, if we have few games, use comprehensive date queries instead
-        if (this.isPreseasonPeriod() && normalizedGames.length < 8) {
-          console.log('🏈 Preseason period detected with limited games - switching to comprehensive date queries...');
-          
-          const dateSpecificGames = await this.getGamesByDateRange(startDate, endDate);
-          const comprehensiveNormalized = this.normalizeGameFormatFutureOnly(dateSpecificGames.games);
-          
-          console.log(`✅ Comprehensive preseason schedule: ${comprehensiveNormalized.length} future games found`);
-          
-          return {
-            games: comprehensiveNormalized,
-            totalGames: comprehensiveNormalized.length,
-            source: 'Comprehensive Date Queries (Preseason)',
-            apiCalls: 1 + dateSpecificGames.apiCalls,
-            dateRange: { start: startDate, end: endDate }
-          };
-        }
-        
-        // Auto-expand if too few games (focused on current period)
-        const config = require('../config/config');
-        const minThreshold = config.schedule.minGamesThreshold || 5;
-        const maxExpansion = config.schedule.maxExpansionDays || 10;
-        
-        if (normalizedGames.length < minThreshold) {
-          console.log(`🔄 <${minThreshold} games found, expanding to ${maxExpansion} days...`);
-          const expandedEndDate = new Date(startDate.getTime() + (maxExpansion * 24 * 60 * 60 * 1000));
-          const expandedGames = this.filterGamesByDateRange(seasonData, startDate, expandedEndDate);
-          const expandedNormalized = this.normalizeGameFormatFutureOnly(expandedGames);
-          
-          console.log(`✅ Expanded schedule: ${expandedNormalized.length} future games found in ${maxExpansion}-day window`);
-          
-          return {
-            games: expandedNormalized,
-            totalGames: expandedNormalized.length,
-            source: `League Season API (${maxExpansion}-day expansion)`,
-            apiCalls: 1,
-            dateRange: { start: startDate, end: expandedEndDate }
-          };
-        }
+        console.log(`   ✅ Comprehensive preseason schedule: ${comprehensiveNormalized.length} future games found`);
         
         return {
-          games: normalizedGames,
-          totalGames: normalizedGames.length,
-          source: 'League Season API',
-          apiCalls: 1,
+          games: comprehensiveNormalized,
+          totalGames: comprehensiveNormalized.length,
+          source: 'TheSportsDB Comprehensive Date Queries (Preseason)',
+          apiCalls: 1 + dateSpecificGames.apiCalls,
           dateRange: { start: startDate, end: endDate }
         };
       }
       
-      // Enhanced fallback: Use date-specific queries for preseason coverage
-      console.log('🔄 Season data incomplete, using enhanced date-specific queries...');
+      // Auto-expand if too few games (focused on current period)
+      const minThreshold = config.schedule.minGamesThreshold || 5;
+      const maxExpansion = config.schedule.maxExpansionDays || 10;
       
-      const dateSpecificGames = await this.getGamesByDateRange(startDate, endDate);
-      const normalizedGames = this.normalizeGameFormatFutureOnly(dateSpecificGames.games);
-      
-      console.log(`✅ Enhanced schedule: ${normalizedGames.length} future games found via date queries`);
+      if (normalizedGames.length < minThreshold) {
+        console.log(`   🔄 <${minThreshold} games found, expanding to ${maxExpansion} days...`);
+        const expandedEndDate = new Date(startDate.getTime() + (maxExpansion * 24 * 60 * 60 * 1000));
+        const expandedGames = this.filterGamesByDateRange(seasonData, startDate, expandedEndDate);
+        const expandedNormalized = this.normalizeGameFormatFutureOnly(expandedGames);
+        
+        console.log(`   ✅ Expanded schedule: ${expandedNormalized.length} future games found in ${maxExpansion}-day window`);
+        
+        return {
+          games: expandedNormalized,
+          totalGames: expandedNormalized.length,
+          source: `TheSportsDB League Season API (${maxExpansion}-day expansion)`,
+          apiCalls: 1,
+          dateRange: { start: startDate, end: expandedEndDate }
+        };
+      }
       
       return {
         games: normalizedGames,
         totalGames: normalizedGames.length,
-        source: 'Date-Specific API Queries',
-        apiCalls: dateSpecificGames.apiCalls,
+        source: 'TheSportsDB League Season API',
+        apiCalls: 1,
         dateRange: { start: startDate, end: endDate }
       };
-      
-    } catch (error) {
-      console.error('❌ League schedule fetch failed:', error.message);
-      
-      // Final fallback: team-by-team approach (legacy method)
-      console.log('🔄 Falling back to team-by-team schedule fetching...');
-      return await this.getTeamBasedSchedule(startDate, endDate);
     }
+    
+    // Enhanced fallback: Use date-specific queries for preseason coverage
+    console.log('   🔄 Season data incomplete, using enhanced date-specific queries...');
+    
+    const dateSpecificGames = await this.getGamesByDateRange(startDate, endDate);
+    const normalizedGames = this.normalizeGameFormatFutureOnly(dateSpecificGames.games);
+    
+    console.log(`   ✅ Enhanced schedule: ${normalizedGames.length} future games found via date queries`);
+    
+    return {
+      games: normalizedGames,
+      totalGames: normalizedGames.length,
+      source: 'TheSportsDB Date-Specific API Queries',
+      apiCalls: dateSpecificGames.apiCalls,
+      dateRange: { start: startDate, end: endDate }
+    };
   }
   
   /**
@@ -478,6 +546,7 @@ class SportsDBAPI {
   /**
    * Parse game date/time to America/New_York timezone
    * Convert all event datetimes to America/New_York as required
+   * ENHANCED: Use strTimeLocal as fallback for better time accuracy
    */
   parseGameDateToTZ(game) {
     // Note: Parse multiple TheSportsDB date formats (dateEvent, strTime, etc.)
@@ -490,40 +559,74 @@ class SportsDBAPI {
       game.dateEventLocal
     ];
     
-    const timeField = game.strTime;
+    // Try multiple time fields - prioritize local time over UTC
+    const timeFields = [
+      game.strTimeLocal, // Often more accurate (e.g., "19:00:00" for 7 PM)
+      game.strTime       // UTC time (sometimes "00:00:00" which is invalid)
+    ];
     
-    for (let i = 0; i < dateFields.length; i++) {
-      const dateStr = dateFields[i];
+    // First, try combining date with local time
+    for (const timeField of timeFields) {
+      if (!timeField) continue;
+      
+      console.log(`   🔍 [DEBUG] Trying time field: "${timeField}"`);
+      
+      for (const dateStr of dateFields) {
+        if (!dateStr) continue;
+        
+        try {
+          // Handle different date formats
+          let fullDateTimeStr = dateStr;
+          
+          // If we have a separate time field, combine them
+          if (timeField && !dateStr.includes(':')) {
+            fullDateTimeStr = `${dateStr} ${timeField}`;
+          }
+          
+          console.log(`   🔍 [DEBUG] Trying combined datetime: "${fullDateTimeStr}"`);
+          
+          // Parse and convert to America/New_York timezone
+          const parsed = this.parseFlexibleDateTime(fullDateTimeStr);
+          
+          if (parsed) {
+            const converted = toTZ(parsed, DEFAULT_TIMEZONE);
+            console.log(`   ✅ [DEBUG] Successfully parsed game time: ${converted.toFormat('MMM d, yyyy h:mm a ZZZZ')}`);
+            return converted;
+          }
+          
+        } catch (error) {
+          console.log(`   ❌ [DEBUG] Parse error for "${dateStr} ${timeField}": ${error.message}`);
+        }
+      }
+    }
+    
+    // Fallback: try date-only fields and default to evening time
+    for (const dateStr of dateFields) {
       if (!dateStr) continue;
       
       try {
-        // Handle different date formats
-        let fullDateTimeStr = dateStr;
-        
-        // If we have a separate time field, combine them
-        if (timeField && !dateStr.includes(':')) {
-          fullDateTimeStr = `${dateStr} ${timeField}`;
-        }
-        
-        // Parse and convert to America/New_York timezone
-        const parsed = this.parseFlexibleDateTime(fullDateTimeStr);
+        // For date-only fields, our parseFlexibleDateTime already defaults to 8 PM EST
+        console.log(`   🔍 [DEBUG] Trying date-only fallback: "${dateStr}"`);
+        const parsed = this.parseFlexibleDateTime(dateStr);
         
         if (parsed) {
           const converted = toTZ(parsed, DEFAULT_TIMEZONE);
+          console.log(`   ✅ [DEBUG] Date-only fallback successful: ${converted.toFormat('MMM d, yyyy h:mm a ZZZZ')}`);
           return converted;
         }
         
       } catch (error) {
-        // Continue to next date field
+        console.log(`   ❌ [DEBUG] Date-only parse error for "${dateStr}": ${error.message}`);
       }
     }
     
+    console.log(`   ❌ [DEBUG] All parsing attempts failed for game`);
     return null;
   }
 
   /**
    * Parse flexible date/time formats that TheSportsDB might use
-   * FIXED: Proper timezone handling and realistic NFL game times
+   * ENHANCED: Reject old dates, proper timezone handling, and realistic NFL game times
    */
   parseFlexibleDateTime(dateTimeStr) {
     if (!dateTimeStr) {
@@ -535,19 +638,40 @@ class SportsDBAPI {
     const cleaned = dateTimeStr.trim();
     console.log(`   🔍 [DEBUG] parseFlexibleDateTime: processing "${cleaned}"`);
     
+    // Get current year for validation
+    const currentYear = new Date().getFullYear();
+    const currentMonth = new Date().getMonth(); // 0-based
+    
     // Try direct parsing first - but validate the result
     const directParse = new Date(cleaned);
     console.log(`   🔍 [DEBUG] Direct parse attempt: ${directParse.toISOString()} (valid: ${!isNaN(directParse.getTime())})`);
     if (!isNaN(directParse.getTime())) {
+      // CRITICAL: Reject dates from wrong year (old data)
+      const parsedYear = directParse.getFullYear();
+      const parsedMonth = directParse.getMonth();
+      
+      // For August 2025, reject 2024 games UNLESS it's current preseason data
+      // Accept 2024 data only if we're in Aug-Dec 2025 looking for 2024-2025 season
+      let isValidYear = false;
+      if (currentYear === 2025 && currentMonth >= 7) { // Aug 2025 or later
+        isValidYear = parsedYear === 2024 || parsedYear === 2025; // Accept both 2024 and 2025
+      } else {
+        isValidYear = parsedYear >= currentYear - 1; // Accept current and previous year
+      }
+      
+      if (!isValidYear) {
+        console.log(`   🗑️ [DEBUG] Direct parse rejected - wrong year (${parsedYear}, expected ${currentYear} or ${currentYear-1})`);
+        return null;
+      }
+      
       // Validate that this is a reasonable NFL game time (not midnight)
-      const hour = directParse.getUTCHours();
       const convertedEST = toTZ(directParse.getTime(), DEFAULT_TIMEZONE);
       const estHour = convertedEST.hour;
       
-      console.log(`   🔍 [DEBUG] Direct parse time check: UTC hour=${hour}, EST hour=${estHour}`);
+      console.log(`   🔍 [DEBUG] Direct parse time check: EST hour=${estHour}, year=${parsedYear}`);
       
-      // NFL games typically between 1pm and 11pm EST - reject midnight times
-      if (estHour >= 13 && estHour <= 23) {
+      // NFL games typically between 12pm and 11pm EST - reject midnight times
+      if (estHour >= 12 && estHour <= 23) {
         console.log(`   ✅ [DEBUG] Direct parse successful with valid time: ${directParse.getTime()}`);
         return directParse.getTime();
       } else {
@@ -558,6 +682,23 @@ class SportsDBAPI {
     // If just a date, assume 8:00 PM EST (typical NFL primetime)
     if (/^\d{4}-\d{2}-\d{2}$/.test(cleaned)) {
       console.log(`   🔍 [DEBUG] Date-only format detected, using 8:00 PM EST default`);
+      
+      // Validate year first
+      const yearMatch = cleaned.match(/^(\d{4})/);
+      if (yearMatch) {
+        const parsedYear = parseInt(yearMatch[1]);
+        let isValidYear = false;
+        if (currentYear === 2025 && currentMonth >= 7) { // Aug 2025 or later
+          isValidYear = parsedYear === 2024 || parsedYear === 2025;
+        } else {
+          isValidYear = parsedYear >= currentYear - 1;
+        }
+        
+        if (!isValidYear) {
+          console.log(`   🗑️ [DEBUG] Date-only rejected - wrong year (${parsedYear})`);
+          return null;
+        }
+      }
       
       // Create explicit EST time (8pm) to avoid timezone confusion
       const moment = require('moment-timezone');
@@ -591,7 +732,22 @@ class SportsDBAPI {
       const attempt = moment.tz(cleaned, format, DEFAULT_TIMEZONE);
       if (attempt.isValid()) {
         const estHour = attempt.hour();
-        console.log(`   🔍 [DEBUG] Format "${format}" parsed to: ${attempt.format('MMM D, YYYY h:mm A z')} (hour: ${estHour})`);
+        const parsedYear = attempt.year();
+        
+        console.log(`   🔍 [DEBUG] Format "${format}" parsed to: ${attempt.format('MMM D, YYYY h:mm A z')} (hour: ${estHour}, year: ${parsedYear})`);
+        
+        // Validate year
+        let isValidYear = false;
+        if (currentYear === 2025 && currentMonth >= 7) {
+          isValidYear = parsedYear === 2024 || parsedYear === 2025;
+        } else {
+          isValidYear = parsedYear >= currentYear - 1;
+        }
+        
+        if (!isValidYear) {
+          console.log(`   🗑️ [DEBUG] Format parse rejected - wrong year (${parsedYear})`);
+          continue;
+        }
         
         // Validate reasonable NFL time
         if (estHour >= 12 && estHour <= 23) {
@@ -671,6 +827,7 @@ class SportsDBAPI {
   /**
    * Normalize game format with strict future-only filtering and timezone conversion
    * All event datetimes converted to America/New_York, filter kickoff >= nowTZ(TZ)
+   * ENHANCED: Comprehensive data validation and quality checks
    * @param {Array} games - Array of raw game objects
    * @returns {Array} Array of normalized future-only games
    */
@@ -679,11 +836,24 @@ class SportsDBAPI {
     
     const now = nowTZ(DEFAULT_TIMEZONE);
     console.log(`   ⏰ Current time (${DEFAULT_TIMEZONE}): ${now.toFormat('MMM d, yyyy h:mm a ZZZZ')}`);
+    console.log(`   🔍 VALIDATION: Processing ${games.length} raw games for normalization`);
+    
+    let validGameCount = 0;
+    let invalidDateCount = 0;
+    let finishedGameCount = 0;
+    let pastGameCount = 0;
+    let wrongYearCount = 0;
+    let invalidTimeCount = 0;
     
     const processedGames = games.map(game => {
       try {
         const homeTeam = textUtils.formatTeamName(game.strHomeTeam || 'TBD');
         const awayTeam = textUtils.formatTeamName(game.strAwayTeam || 'TBD');
+        
+        // VALIDATION: Check for valid team names
+        if (homeTeam === 'TBD' || awayTeam === 'TBD') {
+          console.log(`   ⚠️ VALIDATION WARNING: Missing team data for game: ${awayTeam} @ ${homeTeam}`);
+        }
         
         // DEBUG: Log raw game data to see what date fields are available
         console.log(`   🔍 [DEBUG] Raw game data: ${awayTeam} @ ${homeTeam}`);
@@ -703,12 +873,32 @@ class SportsDBAPI {
         const gameDateTime = this.parseGameDateToTZ(game);
         
         if (!gameDateTime) {
+          invalidDateCount++;
+          console.log(`   ❌ VALIDATION: Invalid date/time for ${awayTeam} @ ${homeTeam}`);
           return null; // Skip games without valid date/time
+        }
+        
+        // VALIDATION: Check for reasonable year (prevent old data)
+        const gameYear = gameDateTime.year;
+        const currentYear = now.year;
+        if (Math.abs(gameYear - currentYear) > 1) {
+          wrongYearCount++;
+          console.log(`   🗑️ VALIDATION: Wrong year ${gameYear} for ${awayTeam} @ ${homeTeam} (current: ${currentYear})`);
+          return null;
+        }
+        
+        // VALIDATION: Check for reasonable game time (12 PM - 11 PM EST)
+        const gameHour = gameDateTime.hour;
+        if (gameHour < 12 || gameHour > 23) {
+          invalidTimeCount++;
+          console.log(`   ⚠️ VALIDATION: Unrealistic game time ${gameHour}:xx EST for ${awayTeam} @ ${homeTeam}`);
+          // Don't skip, but log the issue
         }
         
         // Skip games that are already finished/completed
         const gameStatus = game.strStatus;
         if (gameStatus === 'FT' || gameStatus === 'Finished' || gameStatus === 'Final') {
+          finishedGameCount++;
           console.log(`   🏁 SKIPPING FINISHED GAME: ${awayTeam} @ ${homeTeam} (Status: ${gameStatus})`);
           return null;
         }
@@ -720,10 +910,12 @@ class SportsDBAPI {
         const gameTimeStr = gameDateTime.toFormat('MMM d, yyyy h:mm a ZZZZ');
         
         if (!isFuture) {
+          pastGameCount++;
           console.log(`   🗑️ DROPPING PAST GAME: ${awayTeam} @ ${homeTeam} - ${gameTimeStr}`);
           return null;
         }
         
+        validGameCount++;
         console.log(`   ✅ KEEPING FUTURE GAME: ${awayTeam} @ ${homeTeam} - ${gameTimeStr}`);
         
         // Format date group for grouping
@@ -734,6 +926,11 @@ class SportsDBAPI {
         const dateStr = gameDateTime.toFormat('MMM d');
         const formatted = `${awayTeam} @ ${homeTeam} – ${dateStr}, ${timeStr}`;
         
+        // VALIDATION: Check formatted string quality
+        if (formatted.includes('undefined') || formatted.includes('TBD @ TBD')) {
+          console.log(`   ⚠️ VALIDATION: Poor formatting quality: "${formatted}"`);
+        }
+        
         return {
           formatted: formatted,
           timestamp: gameDateTime.toMillis(),
@@ -742,7 +939,10 @@ class SportsDBAPI {
           homeTeam: homeTeam,
           awayTeam: awayTeam,
           venue: game.strVenue,
-          status: game.strStatus
+          status: game.strStatus,
+          source: game.source || 'TheSportsDB',
+          gameYear: gameYear,
+          gameHour: gameHour
         };
         
       } catch (error) {
@@ -750,6 +950,15 @@ class SportsDBAPI {
         return null;
       }
     }).filter(game => game !== null);
+    
+    // VALIDATION SUMMARY
+    console.log(`   📊 VALIDATION SUMMARY:`);
+    console.log(`      ✅ Valid games: ${validGameCount}`);
+    console.log(`      ❌ Invalid dates: ${invalidDateCount}`);
+    console.log(`      🏁 Finished games: ${finishedGameCount}`);
+    console.log(`      🗑️ Past games: ${pastGameCount}`);
+    console.log(`      📅 Wrong year: ${wrongYearCount}`);
+    console.log(`      ⏰ Invalid times: ${invalidTimeCount}`);
     
     // Add relevance scoring and prioritize current/near-term games
     const scoredGames = this.addRelevanceScoring(processedGames);
@@ -761,6 +970,19 @@ class SportsDBAPI {
       }
       return a.timestamp - b.timestamp; // Earlier time first for same score
     });
+    
+    // FINAL VALIDATION: Check for data quality issues
+    if (scoredGames.length === 0) {
+      console.log(`   ❌ VALIDATION ALERT: No valid games after filtering!`);
+    } else if (scoredGames.length < 3) {
+      console.log(`   ⚠️ VALIDATION WARNING: Only ${scoredGames.length} games found - may indicate data issues`);
+    }
+    
+    // Check for date diversity
+    const uniqueDates = new Set(scoredGames.map(game => game.dateGroup));
+    if (uniqueDates.size === 1 && scoredGames.length > 1) {
+      console.log(`   ⚠️ VALIDATION WARNING: All games on same date (${Array.from(uniqueDates)[0]}) - may indicate limited data`);
+    }
     
     console.log(`   ✅ Processed games: ${scoredGames.length} future games after filtering and prioritization`);
     
