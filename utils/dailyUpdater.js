@@ -943,8 +943,13 @@ class DailyUpdater {
       console.log(`✅ Staggered ${updateType} update posted successfully!`);
 
     } catch (error) {
-      console.error('❌ Error posting staggered updates to Discord:', error);
+      console.error('💥 [CRITICAL] Error posting staggered updates to Discord:', error);
+      console.error('   📍 This will prevent the run from being marked as successful');
       this.logStaggeredUpdatesToConsole(nflData, timeStr, updateType);
+      
+      // RE-THROW ERROR: This is critical! If Discord posting fails, 
+      // the scheduler should NOT record the run as successful
+      throw new Error(`Discord posting failed: ${error.message}`);
     }
   }
 

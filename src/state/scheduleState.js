@@ -162,9 +162,13 @@ class ScheduleState {
    * @param {number} graceMs - Grace period in milliseconds for missed runs
    * @returns {string[]} Array of slot names that are pending
    */
-  async getPendingSlots(now = Date.now(), graceMs = 60 * 60 * 1000) {
+  async getPendingSlots(now = Date.now(), graceMs = 120 * 60 * 1000) { // Extended grace period to 120 minutes
     const state = await this.getState();
     const pendingSlots = [];
+    
+    console.log(`🔍 [MISSED RUN CHECK] Starting missed run detection...`);
+    console.log(`   📅 Current time: ${new Date(now).toISOString()}`);
+    console.log(`   ⏱️ Grace period: ${graceMs/60000} minutes`);
     
     // EST slot times (hours in 24h format)
     const slotTimes = {
@@ -176,29 +180,55 @@ class ScheduleState {
     const moment = require('moment-timezone');
     const nowEST = moment(now).tz('America/New_York');
     const todayEST = nowEST.clone().startOf('day');
+    
+    console.log(`   🌍 Current EST: ${nowEST.format('YYYY-MM-DD HH:mm:ss z')}`);
+    console.log(`   📆 Today EST: ${todayEST.format('YYYY-MM-DD')}`);
 
     for (const [slot, hour] of Object.entries(slotTimes)) {
+      console.log(`\n🔍 [${slot.toUpperCase()}] Checking ${slot} slot...`);
+      
       // Calculate today's scheduled time for this slot
       const scheduledTime = todayEST.clone().hour(hour).minute(0).second(0);
       const scheduledTimestamp = scheduledTime.valueOf();
       
+      console.log(`   📅 Scheduled time: ${scheduledTime.format('YYYY-MM-DD HH:mm:ss z')}`);
+      console.log(`   🔢 Scheduled timestamp: ${scheduledTimestamp}`);
+      
       // Check if slot time has passed and we haven't run it today
       const timeSinceScheduled = now - scheduledTimestamp;
-      const lastRunTime = state.lastRuns[slot];
+      const lastRunTime = state.lastRuns[slot] || 0;
+      
+      console.log(`   ⏰ Time since scheduled: ${timeSinceScheduled}ms (${timeSinceScheduled/60000} min)`);
+      console.log(`   📝 Last run timestamp: ${lastRunTime}`);
+      console.log(`   📝 Last run time: ${lastRunTime > 0 ? new Date(lastRunTime).toISOString() : 'Never'}`);
       
       // Conditions for a pending slot:
       // 1. Scheduled time has passed (positive timeSinceScheduled)
       // 2. Within grace period 
       // 3. Last run was before today's scheduled time
+      const hasPassed = timeSinceScheduled > 0;
       const withinGracePeriod = timeSinceScheduled > 0 && timeSinceScheduled <= graceMs;
       const notRunToday = lastRunTime < scheduledTimestamp;
       
+      console.log(`   ✅ Has passed: ${hasPassed} (${timeSinceScheduled > 0 ? 'YES' : 'NO'})`);
+      console.log(`   ⏱️ Within grace: ${withinGracePeriod} (${timeSinceScheduled}ms <= ${graceMs}ms)`);
+      console.log(`   🚫 Not run today: ${notRunToday} (${lastRunTime} < ${scheduledTimestamp})`);
+      
       if (withinGracePeriod && notRunToday) {
         pendingSlots.push(slot);
-        console.log(`⚠️ Detected missed ${slot} slot: scheduled=${scheduledTime.format()}, lastRun=${new Date(lastRunTime).toISOString()}, gracePeriod=${graceMs/60000}min`);
+        console.log(`   🔔 MISSED RUN DETECTED: Adding ${slot} to pending slots`);
+        console.log(`      📅 Scheduled: ${scheduledTime.format('YYYY-MM-DD HH:mm:ss z')}`);
+        console.log(`      📝 Last run: ${lastRunTime > 0 ? new Date(lastRunTime).toISOString() : 'Never'}`);
+        console.log(`      ⏱️ Grace period: ${graceMs/60000} minutes`);
+      } else {
+        console.log(`   ✅ NO MISSED RUN: ${slot} slot is up to date`);
+        if (!hasPassed) console.log(`      ⏰ Reason: Scheduled time hasn't passed yet`);
+        if (!withinGracePeriod && hasPassed) console.log(`      ⏰ Reason: Outside grace period (${timeSinceScheduled/60000} min > ${graceMs/60000} min)`);
+        if (!notRunToday) console.log(`      ✅ Reason: Already ran today (${new Date(lastRunTime).toISOString()})`);
       }
     }
 
+    console.log(`\n📊 [MISSED RUN SUMMARY] Found ${pendingSlots.length} pending slots: ${pendingSlots.join(', ') || 'None'}`);
     return pendingSlots;
   }
 
