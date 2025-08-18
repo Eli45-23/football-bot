@@ -146,8 +146,8 @@ class NFLScheduleRSSService {
     // Format date group (Today, Tomorrow, Mon 8/16, etc.)
     const dateGroup = this.formatGameDateGroup(gameDateTime);
     
-    // Format game time string
-    const timeStr = gameDateTime.format('h:mm A') + ' EDT';
+    // Format game time string with proper timezone detection
+    const timeStr = gameDateTime.format('h:mm A z'); // Use proper timezone abbreviation instead of hardcoded EDT
     const dateStr = gameDateTime.format('MMM D');
     
     let formatted = `${awayTeam} @ ${homeTeam} – ${dateStr}, ${timeStr}`;
