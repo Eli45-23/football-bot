@@ -1373,7 +1373,36 @@ class DailyUpdater {
    * @returns {Promise} Promise for queued send
    */
   async queuedSend(channel, content, description = 'message') {
-    return offlineQueue.queuedChannelSend(channel, content, this.client, description);
+    try {
+      console.log(`📤 [DISCORD] Attempting to send: ${description}`);
+      
+      const result = await offlineQueue.queuedChannelSend(channel, content, this.client, description);
+      
+      console.log(`✅ [DISCORD] Successfully sent: ${description}`);
+      return result;
+      
+    } catch (error) {
+      console.error(`💥 [DISCORD ERROR] Failed to send: ${description}`);
+      console.error(`   ❌ Error: ${error.message}`);
+      console.error(`   📍 Code: ${error.code || 'No code'}`);
+      console.error(`   🔍 Status: ${error.status || 'No status'}`);
+      console.error(`   🌐 Request: ${error.method || ''} ${error.url || ''}`);
+      
+      // Log Discord-specific error details
+      if (error.code >= 10000) {
+        console.error(`   🤖 Discord API Error: ${error.code}`);
+      }
+      
+      if (error.code === 50013) {
+        console.error(`   🔒 Permission Error: Bot lacks permission to send messages`);
+      }
+      
+      if (error.code === 50001) {
+        console.error(`   👻 Access Error: Bot cannot access this channel`);
+      }
+      
+      throw error; // Re-throw to let parent handler catch it
+    }
   }
 
   /**

@@ -107,14 +107,18 @@ class DailyScheduler {
     const now = moment().tz(this.timezone);
     const clientReady = this.client && this.client.isReady && this.client.isReady();
     
-    console.log(`[SCHED] slot=${slotName} ready=${clientReady} ts=${now.toISOString()}`);
+    console.log(`🎯 [SCHEDULED EXECUTION] ${slotName.toUpperCase()} SLOT TRIGGERED`);
+    console.log(`   📅 Time: ${now.format('YYYY-MM-DD HH:mm:ss z')}`);
+    console.log(`   🤖 Discord Client Ready: ${clientReady}`);
+    console.log(`   🌐 WebSocket Status: ${this.client?.ws?.status || 'Unknown'}`);
 
     if (!clientReady) {
-      console.log(`⚠️ Client not ready for ${slotName} slot - marking as pending`);
+      console.log(`❌ [CRITICAL] Client not ready for ${slotName} slot - marking as pending`);
       await this.markSlotAsPending(slotName);
       return;
     }
 
+    console.log(`✅ [EXECUTION] Starting ${slotName} slot execution...`);
     // Use safeRunSlot for mutex protection and error handling
     await this.safeRunSlot(slotName);
   }
@@ -137,7 +141,7 @@ class DailyScheduler {
   async safeRunSlot(slotName) {
     // Mutex check - prevent overlapping runs of the same slot
     if (this.runningSlots.has(slotName)) {
-      console.log(`⚠️ ${slotName} slot already running, skipping...`);
+      console.log(`⚠️ [MUTEX] ${slotName} slot already running, skipping...`);
       return;
     }
 
@@ -145,40 +149,52 @@ class DailyScheduler {
     const startTime = Date.now();
 
     try {
-      console.log(`🚀 Starting ${slotName} update run...`);
+      console.log(`🚀 [EXECUTION] Starting ${slotName} update run...`);
+      console.log(`   📊 Active slots: ${Array.from(this.runningSlots).join(', ')}`);
+      console.log(`   💾 State check: Checking if recently run...`);
 
       // Final client ready check
       if (!this.client || !this.client.isReady()) {
         throw new Error('Discord client not ready');
       }
 
+      console.log(`✅ [VALIDATION] Client ready, calling dailyUpdater...`);
+
       // Call the existing daily updater
       await this.dailyUpdater.runScheduledUpdate(slotName);
+
+      console.log(`📝 [SUCCESS] DailyUpdater completed, recording successful run...`);
 
       // Record successful run in persistent state
       await scheduleState.setRun(slotName, Date.now());
 
       const duration = Date.now() - startTime;
-      console.log(`✅ ${slotName} update completed successfully in ${duration}ms`);
+      console.log(`🎉 [COMPLETE] ${slotName} update completed successfully in ${duration}ms`);
 
     } catch (error) {
       const duration = Date.now() - startTime;
-      console.error(`❌ ${slotName} update failed after ${duration}ms:`, error.message);
+      console.error(`💥 [FAILURE] ${slotName} update failed after ${duration}ms`);
+      console.error(`   ❌ Error: ${error.message}`);
+      console.error(`   📍 Stack: ${error.stack?.split('\n')[0]}`);
       
       // Log additional context for debugging
-      console.error(`🔍 Error context:`, {
+      console.error(`🔍 [DEBUG] Error context:`, {
         slotName,
         clientReady: this.client && this.client.isReady(),
         wsStatus: this.client?.ws?.status,
         errorCode: error.code,
-        errorStack: error.stack?.split('\n')[0]
+        errorName: error.name,
+        isDiscordAPIError: error.code && error.code >= 10000,
+        isNetworkError: error.code === 'NETWORK_ERROR' || error.code === 'ENOTFOUND'
       });
 
       // Don't record the run as successful if it failed
       // This allows it to be retried on reconnection
+      console.log(`🔄 [RETRY] ${slotName} run NOT recorded as successful - will retry on reconnection`);
 
     } finally {
       this.runningSlots.delete(slotName);
+      console.log(`🔓 [CLEANUP] Released ${slotName} slot mutex`);
     }
   }
 
