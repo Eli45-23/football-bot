@@ -47,7 +47,7 @@ class OfflineQueue {
   }
 
   /**
-   * Create a queued version of channel.send()
+   * Create a queued version of channel.send() with cold start recovery
    * @param {Channel} channel - Discord channel
    * @param {Object} content - Message content (embeds, text, etc.)
    * @param {Client} client - Discord client instance
@@ -56,10 +56,126 @@ class OfflineQueue {
    */
   async queuedChannelSend(channel, content, client, description = 'message') {
     const postingFn = async () => {
-      await channel.send(content);
+      await this.sendWithColdStartRetry(channel, content, description);
     };
     
     return this.enqueue(postingFn, client, description);
+  }
+
+  /**
+   * Send with cold start detection and retry logic
+   * @param {Channel} channel - Discord channel
+   * @param {Object} content - Message content
+   * @param {string} description - Description for logging
+   */
+  async sendWithColdStartRetry(channel, content, description) {
+    const maxRetries = 2;
+    let attempt = 1;
+    
+    while (attempt <= maxRetries) {
+      // Check if this might be a cold start scenario
+      const isColdStart = this.detectColdStart();
+      
+      if (isColdStart && attempt === 1) {
+        console.log(`🧊 [COLD START DETECTED] Potential cold start for ${description} - will retry if needed`);
+      }
+      
+      const startTime = Date.now();
+      
+      try {
+        // Attempt to send
+        await channel.send(content);
+        const duration = Date.now() - startTime;
+        
+        console.log(`✅ [DISCORD] ${description} sent successfully (${duration}ms, attempt ${attempt})`);
+        return; // Success!
+        
+      } catch (error) {
+        const duration = Date.now() - startTime;
+        
+        // Check if this looks like a cold start timeout
+        const isColdStartError = this.isColdStartError(error, duration);
+        
+        if (isColdStartError && attempt < maxRetries) {
+          const retryDelay = 60000; // 60 seconds for instance to warm up
+          console.log(`🧊 [COLD START RETRY] ${description} failed due to cold start, retrying in ${retryDelay/1000}s (attempt ${attempt}/${maxRetries})`);
+          console.log(`   ❄️ Error: ${error.message}`);
+          
+          // Wait for instance to warm up
+          await this.sleep(retryDelay);
+          attempt++;
+          continue;
+        }
+        
+        // Not a cold start error or max retries reached
+        console.error(`❌ [DISCORD FINAL ERROR] ${description} failed on attempt ${attempt}/${maxRetries}`);
+        throw error;
+      }
+    }
+  }
+
+  /**
+   * Detect if we're likely in a cold start scenario
+   * @returns {boolean} True if cold start is likely
+   */
+  detectColdStart() {
+    // Check global instance state if available
+    if (global.instanceState) {
+      const timeSinceLastActivity = Date.now() - global.instanceState.lastActivity;
+      const timeSinceStart = Date.now() - global.instanceState.startTime;
+      
+      // Cold start likely if:
+      // 1. Instance just started (less than 2 minutes up)
+      // 2. No activity for more than 15 minutes
+      const justStarted = timeSinceStart < 120000; // 2 minutes
+      const longInactive = timeSinceLastActivity > 900000; // 15 minutes
+      
+      if (justStarted || longInactive) {
+        console.log(`🧊 [COLD START DETECTION] Instance conditions: uptime=${(timeSinceStart/1000).toFixed(1)}s, inactive=${(timeSinceLastActivity/1000).toFixed(1)}s`);
+        return true;
+      }
+    }
+    
+    return false;
+  }
+
+  /**
+   * Check if an error looks like a cold start related issue
+   * @param {Error} error - The error that occurred
+   * @param {number} duration - How long the operation took
+   * @returns {boolean} True if this looks like a cold start error
+   */
+  isColdStartError(error, duration) {
+    const message = error.message?.toLowerCase() || '';
+    const code = error.code;
+    
+    // Common cold start error patterns
+    const coldStartIndicators = [
+      'timeout',
+      'etimedout', 
+      'econnreset',
+      'enotfound',
+      'network error',
+      'connection failed',
+      'socket hang up'
+    ];
+    
+    const hasIndicator = coldStartIndicators.some(indicator => 
+      message.includes(indicator) || code === indicator.toUpperCase()
+    );
+    
+    // Also consider very long durations as potential cold start issues
+    const veryLongDuration = duration > 30000; // 30+ seconds
+    
+    return hasIndicator || veryLongDuration;
+  }
+
+  /**
+   * Sleep utility for retry delays
+   * @param {number} ms - Milliseconds to sleep
+   */
+  async sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   /**

@@ -14,6 +14,7 @@ class DailyScheduler {
     this.dailyUpdater = null;
     this.activeTimeouts = new Map(); // Track active timeouts for each slot
     this.runningSlots = new Set(); // Mutex to prevent overlapping runs
+    this.keepAliveInterval = null; // Keep-alive interval to prevent cold starts
     
     // EST timezone for all scheduling
     this.timezone = 'America/New_York';
@@ -51,6 +52,9 @@ class DailyScheduler {
     for (const [slotName] of Object.entries(this.slots)) {
       await this.scheduleNextRun(slotName);
     }
+
+    // Start keep-alive ping to prevent Render cold starts (every 14 minutes)
+    this.startKeepAlive();
 
     console.log('✅ Resilient scheduler configured for all slots');
   }
@@ -97,6 +101,78 @@ class DailyScheduler {
     }, msUntilRun);
 
     this.activeTimeouts.set(slotName, timeoutId);
+  }
+
+  /**
+   * Start keep-alive ping system to prevent Render cold starts
+   * Pings the /ping endpoint every 14 minutes to keep instance warm
+   */
+  startKeepAlive() {
+    // Clear any existing keep-alive
+    if (this.keepAliveInterval) {
+      clearInterval(this.keepAliveInterval);
+    }
+
+    const KEEP_ALIVE_INTERVAL = 14 * 60 * 1000; // 14 minutes in milliseconds
+    
+    console.log('📡 Starting keep-alive system (14-minute ping cycle)');
+    
+    // Start immediately with a ping
+    this.performKeepAlivePing();
+    
+    // Set up recurring pings
+    this.keepAliveInterval = setInterval(() => {
+      this.performKeepAlivePing();
+    }, KEEP_ALIVE_INTERVAL);
+  }
+
+  /**
+   * Perform a keep-alive ping to the local /ping endpoint
+   */
+  async performKeepAlivePing() {
+    try {
+      const http = require('http');
+      const port = process.env.PORT || 10000;
+      
+      const options = {
+        hostname: 'localhost',
+        port: port,
+        path: '/ping',
+        method: 'GET',
+        timeout: 5000
+      };
+
+      const req = http.request(options, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+          try {
+            const response = JSON.parse(data);
+            console.log(`📡 [KEEP-ALIVE] Ping successful - Instance warm (${response.instance?.pingCount || 'unknown'} total pings)`);
+            
+            // Update global instance state with activity
+            if (global.instanceState) {
+              global.instanceState.lastActivity = Date.now();
+            }
+          } catch (error) {
+            console.log('📡 [KEEP-ALIVE] Ping successful (response parsing failed)');
+          }
+        });
+      });
+
+      req.on('error', (error) => {
+        console.error(`❌ [KEEP-ALIVE] Ping failed: ${error.message}`);
+      });
+
+      req.on('timeout', () => {
+        req.destroy();
+        console.error('⏰ [KEEP-ALIVE] Ping timeout');
+      });
+
+      req.end();
+    } catch (error) {
+      console.error(`❌ [KEEP-ALIVE] Ping error: ${error.message}`);
+    }
   }
 
   /**
@@ -277,6 +353,13 @@ class DailyScheduler {
     for (const [slotName, timeoutId] of this.activeTimeouts.entries()) {
       clearTimeout(timeoutId);
       console.log(`⏹️ Cancelled scheduled ${slotName} run`);
+    }
+
+    // Stop keep-alive
+    if (this.keepAliveInterval) {
+      clearInterval(this.keepAliveInterval);
+      this.keepAliveInterval = null;
+      console.log('📡 Keep-alive system stopped');
     }
 
     this.activeTimeouts.clear();
