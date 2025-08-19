@@ -15,6 +15,7 @@ class DailyScheduler {
     this.activeTimeouts = new Map(); // Track active timeouts for each slot
     this.runningSlots = new Set(); // Mutex to prevent overlapping runs
     this.keepAliveInterval = null; // Keep-alive interval to prevent cold starts
+    this.pingingInProgress = false; // Prevent concurrent pings
     
     // EST timezone for all scheduling
     this.timezone = 'America/New_York';
@@ -130,6 +131,14 @@ class DailyScheduler {
    * Perform a keep-alive ping to the local /ping endpoint
    */
   async performKeepAlivePing() {
+    // Prevent multiple concurrent pings
+    if (this.pingingInProgress) {
+      console.log('📡 [KEEP-ALIVE] Ping already in progress, skipping...');
+      return;
+    }
+    
+    this.pingingInProgress = true;
+    
     try {
       const http = require('http');
       const port = process.env.PORT || 10000;
@@ -172,6 +181,8 @@ class DailyScheduler {
       req.end();
     } catch (error) {
       console.error(`❌ [KEEP-ALIVE] Ping error: ${error.message}`);
+    } finally {
+      this.pingingInProgress = false;
     }
   }
 
